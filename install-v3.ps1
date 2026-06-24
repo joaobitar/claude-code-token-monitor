@@ -89,9 +89,12 @@ if ($projectDir -and (Test-Path "$projectDir\.git")) {
     } catch {}
 }
 
-# ── Threshold check (save-context at 70/85/95%) ───────────────────────────
-# statusLine is the only hook that receives context_window data
-$claudeDir = Join-Path $projectDir ".claude"
+# -- Threshold check (save-context at 70/85/95%) --
+# Use $PSScriptRoot (absolute) so paths are reliable regardless of cwd or payload content
+$hooksDir    = $PSScriptRoot                     # .claude/hooks/
+$claudeDir   = Split-Path $PSScriptRoot -Parent  # .claude/
+$projectRoot = Split-Path $claudeDir -Parent     # project root
+
 $stateFile = Join-Path $claudeDir "threshold-state.json"
 $state = @{ t70 = $false; t85 = $false; t95 = $false; lastPct = 0 }
 if (Test-Path $stateFile) {
@@ -107,18 +110,32 @@ if (Test-Path $stateFile) {
 $isNewSession = ($state.lastPct -gt 20) -and ($pct -lt 5)
 if ($isNewSession) { $state.t70 = $false; $state.t85 = $false; $state.t95 = $false }
 
+# Fire highest newly-crossed threshold; mark all lower ones done to avoid duplicates
+# when usage jumps across multiple boundaries (e.g. 60% -> 87% skipping 70%)
 $trigger = $null
-if     ($pct -ge 95 -and -not $state.t95) { $state.t95 = $true; $trigger = "threshold_95pct_used" }
-elseif ($pct -ge 85 -and -not $state.t85) { $state.t85 = $true; $trigger = "threshold_85pct_used" }
-elseif ($pct -ge 70 -and -not $state.t70) { $state.t70 = $true; $trigger = "threshold_70pct_used" }
+if ($pct -ge 95 -and -not $state.t95) {
+    $state.t95 = $true; $state.t85 = $true; $state.t70 = $true
+    $trigger = "threshold_95pct_used"
+} elseif ($pct -ge 85 -and -not $state.t85) {
+    $state.t85 = $true; $state.t70 = $true
+    $trigger = "threshold_85pct_used"
+} elseif ($pct -ge 70 -and -not $state.t70) {
+    $state.t70 = $true
+    $trigger = "threshold_70pct_used"
+}
 $state.lastPct = $pct
 
 if (-not (Test-Path $claudeDir)) { New-Item -ItemType Directory -Path $claudeDir -Force | Out-Null }
 $state | ConvertTo-Json | Out-File $stateFile -Encoding UTF8 -Force
 
 if ($trigger) {
-    $hooksDir = Join-Path $claudeDir "hooks"
-    Start-Process powershell -ArgumentList "-NoProfile -NonInteractive -File `"$(Join-Path $hooksDir 'save-context.ps1')`" -Trigger `"$trigger`" -ProjectRoot `"$projectDir`"" -WindowStyle Hidden
+    $saveScript = Join-Path $hooksDir "save-context.ps1"
+    Start-Process powershell -ArgumentList @(
+        "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", $saveScript,
+        "-Trigger", $trigger,
+        "-ProjectRoot", $projectRoot
+    ) -WindowStyle Hidden
 }
 
 # ── Helpers ────────────────────────────────────────────────────────────────

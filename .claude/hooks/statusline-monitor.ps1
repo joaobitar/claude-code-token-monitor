@@ -1,4 +1,4 @@
-﻿[Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+[Console]::InputEncoding  = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $raw = [Console]::In.ReadToEnd()
@@ -10,13 +10,13 @@ $reset = "$e[0m"
 $bold  = "$e[1m"
 $dim   = "$e[2m"
 
-# â”€â”€ Context window (current session) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- Context window (current session) --
 $pct        = if ($null -ne $json.context_window.used_percentage) { [int]$json.context_window.used_percentage } else { 0 }
 $tokensUsed = [int]($json.context_window.total_input_tokens) + [int]($json.context_window.total_output_tokens)
 $cost       = if ($null -ne $json.cost.total_cost_usd) { $json.cost.total_cost_usd } else { 0 }
 $model      = if ($json.model.display_name) { $json.model.display_name } else { "Claude" }
 
-# â”€â”€ Rate limits (directly from payload) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- Rate limits (directly from payload) --
 $pct5h      = if ($null -ne $json.rate_limits.five_hour.used_percentage) { [int]$json.rate_limits.five_hour.used_percentage } else { 0 }
 $pctWeek    = if ($null -ne $json.rate_limits.seven_day.used_percentage) { [int]$json.rate_limits.seven_day.used_percentage } else { 0 }
 $resetsAt   = if ($null -ne $json.rate_limits.five_hour.resets_at)       { [long]$json.rate_limits.five_hour.resets_at }       else { 0 }
@@ -26,7 +26,7 @@ if ($resetsAt -gt 0) {
     try { $resetStr = [DateTimeOffset]::FromUnixTimeSeconds($resetsAt).ToLocalTime().ToString("HH:mm") } catch {}
 }
 
-# â”€â”€ Git info â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- Git info --
 $repo = ""; $branch = ""
 $projectDir = if ($json.workspace.project_dir) { $json.workspace.project_dir } elseif ($json.cwd) { $json.cwd } else { "" }
 if ($projectDir -and (Test-Path "$projectDir\.git")) {
@@ -36,9 +36,12 @@ if ($projectDir -and (Test-Path "$projectDir\.git")) {
     } catch {}
 }
 
-# â”€â”€ Threshold check (save-context at 70/85/95%) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# statusLine is the only hook that receives context_window data
-$claudeDir = Join-Path $projectDir ".claude"
+# -- Threshold check (save-context at 70/85/95%) --
+# Use $PSScriptRoot (absolute) so paths are reliable regardless of cwd or payload content
+$hooksDir    = $PSScriptRoot                     # .claude/hooks/
+$claudeDir   = Split-Path $PSScriptRoot -Parent  # .claude/
+$projectRoot = Split-Path $claudeDir -Parent     # project root
+
 $stateFile = Join-Path $claudeDir "threshold-state.json"
 $state = @{ t70 = $false; t85 = $false; t95 = $false; lastPct = 0 }
 if (Test-Path $stateFile) {
@@ -54,28 +57,42 @@ if (Test-Path $stateFile) {
 $isNewSession = ($state.lastPct -gt 20) -and ($pct -lt 5)
 if ($isNewSession) { $state.t70 = $false; $state.t85 = $false; $state.t95 = $false }
 
+# Fire highest newly-crossed threshold; mark all lower ones done to avoid duplicates
+# when usage jumps across multiple boundaries (e.g. 60% -> 87% skipping 70%)
 $trigger = $null
-if     ($pct -ge 95 -and -not $state.t95) { $state.t95 = $true; $trigger = "threshold_95pct_used" }
-elseif ($pct -ge 85 -and -not $state.t85) { $state.t85 = $true; $trigger = "threshold_85pct_used" }
-elseif ($pct -ge 70 -and -not $state.t70) { $state.t70 = $true; $trigger = "threshold_70pct_used" }
+if ($pct -ge 95 -and -not $state.t95) {
+    $state.t95 = $true; $state.t85 = $true; $state.t70 = $true
+    $trigger = "threshold_95pct_used"
+} elseif ($pct -ge 85 -and -not $state.t85) {
+    $state.t85 = $true; $state.t70 = $true
+    $trigger = "threshold_85pct_used"
+} elseif ($pct -ge 70 -and -not $state.t70) {
+    $state.t70 = $true
+    $trigger = "threshold_70pct_used"
+}
 $state.lastPct = $pct
 
 if (-not (Test-Path $claudeDir)) { New-Item -ItemType Directory -Path $claudeDir -Force | Out-Null }
 $state | ConvertTo-Json | Out-File $stateFile -Encoding UTF8 -Force
 
 if ($trigger) {
-    $hooksDir = Join-Path $claudeDir "hooks"
-    Start-Process powershell -ArgumentList "-NoProfile -NonInteractive -File `"$(Join-Path $hooksDir 'save-context.ps1')`" -Trigger `"$trigger`" -ProjectRoot `"$projectDir`"" -WindowStyle Hidden
+    $saveScript = Join-Path $hooksDir "save-context.ps1"
+    Start-Process powershell -ArgumentList @(
+        "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", $saveScript,
+        "-Trigger", $trigger,
+        "-ProjectRoot", $projectRoot
+    ) -WindowStyle Hidden
 }
 
-# â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- Helpers --
 function Format-Tokens($t) {
     if ($t -ge 1000000) { return "$([math]::Round($t/1000000,1))M" }
     if ($t -ge 1000)    { return "$([int]($t/1000))k" }
     return "$t"
 }
 
-# â”€â”€ Progress bar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- Progress bar --
 $barWidth = 20
 $filled   = [math]::Round($pct * $barWidth / 100)
 $bar = ""
