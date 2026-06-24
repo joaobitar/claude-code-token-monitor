@@ -1,0 +1,28 @@
+﻿{
+    "statusLine":  {
+                       "type":  "command",
+                       "command":  "powershell -NoProfile -NonInteractive -File \".claude\\hooks\\statusline-monitor.ps1\""
+                   },
+    "hooks":  {
+                  "PreCompact":  [
+                                     {
+                                         "hooks":  [
+                                                       {
+                                                           "type":  "command",
+                                                           "command":  "powershell -NoProfile -NonInteractive -File \".claude\\hooks\\pre-compact.ps1\""
+                                                       }
+                                                   ]
+                                     }
+                                 ],
+                  "Stop":  [
+                               {
+                                   "hooks":  [
+                                                 {
+                                                     "type":  "command",
+                                                     "command":  "powershell -NoProfile -NonInteractive -File \".claude\\hooks\\stop-hook.ps1\""
+                                                 }
+                                             ]
+                               }
+                           ]
+              }
+}

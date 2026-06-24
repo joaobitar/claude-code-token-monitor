@@ -1,0 +1,6 @@
+# Claude Code local settings and runtime state
+.claude/settings.local.json
+.claude/threshold-state.json
+
+# Temporary files
+prompt.md
