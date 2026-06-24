@@ -24,13 +24,29 @@ echo ""
 # STEP 1: Clean up previous install
 # -----------------------------------------------------------------------
 echo "[1/6] Cleaning up previous install..."
-OLD_DIR="$ROOT/.claude-code"
-if [ -d "$OLD_DIR" ]; then
-    rm -rf "$OLD_DIR"
-    echo "      Removed .claude-code/"
-else
-    echo "      Nothing to clean"
+cleaned=false
+
+# v1 used a separate .claude-code/ directory
+if [ -d "$ROOT/.claude-code" ]; then
+    rm -rf "$ROOT/.claude-code"
+    echo "      Removed .claude-code/"; cleaned=true
 fi
+
+# Remove old hook file names used in previous versions
+for old_hook in monitor.sh token-monitor.sh threshold-monitor.sh context-monitor.sh; do
+    if [ -f "$HOOKS_DIR/$old_hook" ]; then
+        rm -f "$HOOKS_DIR/$old_hook"
+        echo "      Removed old hook: $old_hook"; cleaned=true
+    fi
+done
+
+# Reset threshold state so all thresholds fire fresh after reinstall
+if [ -f "$CLAUDE_DIR/threshold-state.json" ]; then
+    rm -f "$CLAUDE_DIR/threshold-state.json"
+    echo "      Reset threshold-state.json"; cleaned=true
+fi
+
+[ "$cleaned" = false ] && echo "      Nothing to clean"
 echo "[OK] Cleanup done"
 
 # -----------------------------------------------------------------------
@@ -64,21 +80,26 @@ try:
 except Exception:
     sys.exit(0)
 
+import math
 cw      = d.get("context_window", {})
 rl      = d.get("rate_limits", {})
 fh      = rl.get("five_hour", {})
 sd      = rl.get("seven_day", {})
-cu      = cw.get("current_usage", {})
 ws      = d.get("workspace", {})
 cost_d  = d.get("cost", {})
 model_d = d.get("model", {})
 
-pct        = int(cw.get("used_percentage", 0))
-tok_in     = int(cw.get("total_input_tokens", 0))
-tok_out    = int(cw.get("total_output_tokens", 0))
-tokens_used = tok_in + tok_out
-cost       = float(cost_d.get("total_cost_usd", 0))
-model      = model_d.get("display_name", "Claude")
+# Compute pct from all token types (including cache) to match Claude Code's counter
+budget      = int(cw.get("budget_tokens", 0))
+tok_in      = int(cw.get("total_input_tokens", 0))
+tok_out     = int(cw.get("total_output_tokens", 0))
+tok_cache_w = int(cw.get("cache_creation_input_tokens", 0))
+tok_cache_r = int(cw.get("cache_read_input_tokens", 0))
+tokens_used = tok_in + tok_out + tok_cache_w + tok_cache_r
+pct = math.ceil(tokens_used * 100.0 / budget) if budget > 0 else int(cw.get("used_percentage", 0))
+
+cost        = float(cost_d.get("total_cost_usd", 0))
+model       = model_d.get("display_name", "Claude")
 project_dir = ws.get("project_dir", ws.get("current_dir", d.get("cwd", "")))
 
 pct_5h   = int(fh.get("used_percentage", 0))
@@ -110,8 +131,13 @@ print(f"TOK_STR={fmt(tokens_used)}")
 PY
     )"
 elif command -v jq &>/dev/null; then
-    PCT=$(echo "$raw"   | jq -r '.context_window.used_percentage // 0')
-    TOKENS_USED=$(echo "$raw" | jq -r '(.context_window.total_input_tokens // 0) + (.context_window.total_output_tokens // 0)')
+    BUDGET=$(echo "$raw" | jq -r '.context_window.budget_tokens // 0')
+    TOKENS_USED=$(echo "$raw" | jq -r '(.context_window.total_input_tokens // 0) + (.context_window.total_output_tokens // 0) + (.context_window.cache_creation_input_tokens // 0) + (.context_window.cache_read_input_tokens // 0)')
+    if [ "${BUDGET:-0}" -gt 0 ] 2>/dev/null; then
+        PCT=$(awk "BEGIN { x=$TOKENS_USED*100.0/$BUDGET; i=int(x); printf \"%d\", (x>i)?i+1:i }")
+    else
+        PCT=$(echo "$raw" | jq -r '.context_window.used_percentage // 0')
+    fi
     COST=$(echo "$raw"  | jq -r '.cost.total_cost_usd // 0')
     MODEL=$(echo "$raw" | jq -r '.model.display_name // "Claude"')
     PROJECT_DIR=$(echo "$raw" | jq -r '.workspace.project_dir // .workspace.current_dir // .cwd // ""')
@@ -148,9 +174,9 @@ is_new=false
 [ "$last_pct" -gt 20 ] && [ "$PCT" -lt 5 ] && is_new=true && t70=false && t85=false && t95=false
 
 TRIGGER=""
-if   [ "$PCT" -ge 95 ] && [ "$t95" = "false" ]; then t95=true;  TRIGGER="threshold_95pct_used"
-elif [ "$PCT" -ge 85 ] && [ "$t85" = "false" ]; then t85=true;  TRIGGER="threshold_85pct_used"
-elif [ "$PCT" -ge 70 ] && [ "$t70" = "false" ]; then t70=true;  TRIGGER="threshold_70pct_used"
+if   [ "$PCT" -ge 95 ] && [ "$t95" = "false" ]; then t95=true; t85=true; t70=true; TRIGGER="threshold_95pct_used"
+elif [ "$PCT" -ge 85 ] && [ "$t85" = "false" ]; then           t85=true; t70=true; TRIGGER="threshold_85pct_used"
+elif [ "$PCT" -ge 70 ] && [ "$t70" = "false" ]; then                     t70=true; TRIGGER="threshold_70pct_used"
 fi
 
 if command -v python3 &>/dev/null; then

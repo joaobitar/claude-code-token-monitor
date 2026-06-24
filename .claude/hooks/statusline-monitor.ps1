@@ -11,10 +11,23 @@ $bold  = "$e[1m"
 $dim   = "$e[2m"
 
 # -- Context window (current session) --
-$pct        = if ($null -ne $json.context_window.used_percentage) { [int]$json.context_window.used_percentage } else { 0 }
-$tokensUsed = [int]($json.context_window.total_input_tokens) + [int]($json.context_window.total_output_tokens)
-$cost       = if ($null -ne $json.cost.total_cost_usd) { $json.cost.total_cost_usd } else { 0 }
-$model      = if ($json.model.display_name) { $json.model.display_name } else { "Claude" }
+# Compute percentage from ALL token types (including cache) so it matches
+# Claude Code's internal "X% remaining" counter. used_percentage omits cache tokens.
+$budgetTokens  = if ($null -ne $json.context_window.budget_tokens)               { [long]$json.context_window.budget_tokens }               else { 0 }
+$tokInput      = if ($null -ne $json.context_window.total_input_tokens)          { [long]$json.context_window.total_input_tokens }          else { 0 }
+$tokOutput     = if ($null -ne $json.context_window.total_output_tokens)         { [long]$json.context_window.total_output_tokens }         else { 0 }
+$tokCacheWrite = if ($null -ne $json.context_window.cache_creation_input_tokens) { [long]$json.context_window.cache_creation_input_tokens } else { 0 }
+$tokCacheRead  = if ($null -ne $json.context_window.cache_read_input_tokens)     { [long]$json.context_window.cache_read_input_tokens }     else { 0 }
+$tokensUsed    = $tokInput + $tokOutput + $tokCacheWrite + $tokCacheRead
+
+$pct = if ($budgetTokens -gt 0) {
+    [int][math]::Ceiling($tokensUsed * 100.0 / $budgetTokens)
+} elseif ($null -ne $json.context_window.used_percentage) {
+    [int]$json.context_window.used_percentage
+} else { 0 }
+
+$cost  = if ($null -ne $json.cost.total_cost_usd) { $json.cost.total_cost_usd } else { 0 }
+$model = if ($json.model.display_name) { $json.model.display_name } else { "Claude" }
 
 # -- Rate limits (directly from payload) --
 $pct5h      = if ($null -ne $json.rate_limits.five_hour.used_percentage) { [int]$json.rate_limits.five_hour.used_percentage } else { 0 }
