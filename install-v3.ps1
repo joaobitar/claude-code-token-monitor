@@ -82,18 +82,14 @@ $bold  = "$e[1m"
 $dim   = "$e[2m"
 
 # -- Context window (current session) --
-# Compute percentage from ALL token types (including cache) so it matches
-# Claude Code's internal "X% remaining" counter. used_percentage omits cache tokens.
-$budgetTokens  = if ($null -ne $json.context_window.budget_tokens)               { [long]$json.context_window.budget_tokens }               else { 0 }
-$tokInput      = if ($null -ne $json.context_window.total_input_tokens)          { [long]$json.context_window.total_input_tokens }          else { 0 }
-$tokOutput     = if ($null -ne $json.context_window.total_output_tokens)         { [long]$json.context_window.total_output_tokens }         else { 0 }
-$tokCacheWrite = if ($null -ne $json.context_window.cache_creation_input_tokens) { [long]$json.context_window.cache_creation_input_tokens } else { 0 }
-$tokCacheRead  = if ($null -ne $json.context_window.cache_read_input_tokens)     { [long]$json.context_window.cache_read_input_tokens }     else { 0 }
-$tokensUsed    = $tokInput + $tokOutput + $tokCacheWrite + $tokCacheRead
+# total_input_tokens already includes cache tokens (verified via payload dump).
+# context_window_size is the correct field name (not budget_tokens).
+# We take Max(calcPct, used_percentage) to never underestimate vs Claude Code's own counter.
+$budgetTokens = if ($null -ne $json.context_window.context_window_size) { [long]$json.context_window.context_window_size } else { 0 }
+$tokInput     = if ($null -ne $json.context_window.total_input_tokens)  { [long]$json.context_window.total_input_tokens }  else { 0 }
+$tokOutput    = if ($null -ne $json.context_window.total_output_tokens) { [long]$json.context_window.total_output_tokens } else { 0 }
+$tokensUsed   = $tokInput + $tokOutput
 
-# Take the higher of our calculation and the API's own used_percentage.
-# budget_tokens = full context window size, but Claude Code compacts earlier;
-# used_percentage reflects the effective budget — so we must not go below it.
 $apiPct  = if ($null -ne $json.context_window.used_percentage) { [int]$json.context_window.used_percentage } else { 0 }
 $calcPct = if ($budgetTokens -gt 0) { [int][math]::Ceiling($tokensUsed * 100.0 / $budgetTokens) } else { 0 }
 $pct     = [Math]::Max($calcPct, $apiPct)
