@@ -94,6 +94,18 @@ $state.lastPct = $pct
 if (-not (Test-Path $claudeDir)) { New-Item -ItemType Directory -Path $claudeDir -Force | Out-Null }
 $state | ConvertTo-Json | Out-File $stateFile -Encoding UTF8 -Force
 
+# -- Display config --
+$cfgFile = Join-Path $claudeDir "monitor-config.json"
+$cfg = @{ show_repo=$true; show_branch=$true; show_context=$true; show_5h=$true; show_reset=$true; show_week=$true; show_cost=$true; show_model=$true }
+if (Test-Path $cfgFile) {
+    try {
+        $c = Get-Content $cfgFile -Raw | ConvertFrom-Json
+        foreach ($k in @('show_repo','show_branch','show_context','show_5h','show_reset','show_week','show_cost','show_model')) {
+            if ($null -ne $c.$k) { $cfg[$k] = [bool]$c.$k }
+        }
+    } catch {}
+}
+
 if ($trigger) {
     $saveNotify = "Saving CONTEXT.md (${pct}% used, trigger: $trigger)..."
     $saveScript = Join-Path $hooksDir "save-context.ps1"
@@ -138,13 +150,16 @@ $costStr = "`${0:F3}" -f $cost
 $tokStr  = Format-Tokens $tokensUsed
 
 $parts = @()
-if ($repo)   { $parts += "${bold}$e[33m${repo}$reset" }
-if ($branch) { $parts += "${bold}$e[36m(${branch})$reset" }
-$parts += "$alert [$bar] ${pct}% (${tokStr})"
-$parts += "$e[35m5h: ${pct5h}%$reset  reset ${resetStr}"
-$parts += "$e[34mWeek: ${pctWeek}%$reset"
-$parts += "$e[33m${costStr}$reset"
-$parts += "$e[36m${model}$reset"
+if ($cfg.show_repo    -and $repo)   { $parts += "${bold}$e[33m${repo}$reset" }
+if ($cfg.show_branch  -and $branch) { $parts += "${bold}$e[36m(${branch})$reset" }
+if ($cfg.show_context) { $parts += "$alert [$bar] ${pct}% (${tokStr})" }
+$rateStr = @()
+if ($cfg.show_5h)    { $rateStr += "$e[35m5h: ${pct5h}%$reset" }
+if ($cfg.show_reset) { $rateStr += "reset ${resetStr}" }
+if ($rateStr.Count -gt 0) { $parts += ($rateStr -join "  ") }
+if ($cfg.show_week)  { $parts += "$e[34mWeek: ${pctWeek}%$reset" }
+if ($cfg.show_cost)  { $parts += "$e[33m${costStr}$reset" }
+if ($cfg.show_model) { $parts += "$e[36m${model}$reset" }
 
 if ($saveNotify) { Write-Host $saveNotify }
 Write-Host ($parts -join " ${dim}|$reset ")

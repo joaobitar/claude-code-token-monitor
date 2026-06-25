@@ -8,7 +8,7 @@ Sistema de monitoramento de tokens para Claude Code CLI. Instala hooks que:
 3. Salvam `CONTEXT.md` antes de compactação automática de sessão (pre-compact hook)
 4. Disponibilizam o slash command `/save-context` para save manual
 
-**Versão atual**: 3.2 — estável, publicada, sem mudanças pendentes.
+**Versão atual**: 3.3 — estável, publicada, sem mudanças pendentes.
 
 ---
 
@@ -27,6 +27,7 @@ token_monitor/
     ├── threshold-state.json          ← Estado runtime dos thresholds (gitignored)
     ├── context-saves.log             ← Log de saves (gitignored)
     ├── save-done.txt                 ← Marcador temporário de conclusão de save (runtime)
+    ├── monitor-config.json           ← Configuração de campos do display (editável pelo usuário)
     ├── hooks/
     │   ├── statusline-monitor.ps1   ← Status bar + threshold check (ponto central)
     │   ├── save-context.ps1         ← Lógica compartilhada de geração do CONTEXT.md
@@ -87,6 +88,12 @@ $projectRoot = Split-Path $claudeDir -Parent     # raiz do projeto
 ```
 
 Nunca use `Get-Location` ou paths do payload JSON para escrever arquivos — são não-confiáveis.
+
+### Configuração de display
+
+O arquivo `.claude/monitor-config.json` controla quais campos aparecem na barra. É lido a cada invocação do `statusline-monitor.ps1`; qualquer campo ausente tem `true` como default. O instalador cria o arquivo com todos os campos habilitados, mas **não sobrescreve** se já existir — configuração do usuário é preservada em reinstalls.
+
+Campos disponíveis: `show_repo`, `show_branch`, `show_context`, `show_5h`, `show_reset`, `show_week`, `show_cost`, `show_model`.
 
 ### Notificação de save-context
 

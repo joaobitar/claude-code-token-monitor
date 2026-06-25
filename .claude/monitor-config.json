@@ -1,0 +1,10 @@
+{
+  "show_repo":    true,
+  "show_branch":  true,
+  "show_context": true,
+  "show_5h":      true,
+  "show_reset":   true,
+  "show_week":    true,
+  "show_cost":    true,
+  "show_model":   true
+}

@@ -83,15 +83,37 @@ seu-projeto/
 token_monitor (master) | ATN [##########----------] 73% (180k) | 5h: 45%  reset 14:30 | Week: 12% | $0.042 | Claude Sonnet 4.6
 ```
 
-| Campo | Descrição |
-|-------|-----------|
-| `repo (branch)` | Nome do repositório e branch git |
-| `FREE/OK/ATN/WARN/CRIT` | Nível de alerta (0–19% / 20–69% / 70–84% / 85–94% / 95%+) |
-| `[bar] pct% (Xtok)` | % da janela de contexto usada + total de tokens (inclui cache) |
-| `5h: X%  reset HH:MM` | Uso do rate limit de 5h e horário de reset |
-| `Week: X%` | Uso do rate limit semanal |
-| `$X.XXX` | Custo total da sessão (relevante para planos de API) |
-| `model` | Modelo em uso |
+| Campo | Chave config | Descrição |
+|-------|-------------|-----------|
+| `repo` | `show_repo` | Nome do repositório git |
+| `(branch)` | `show_branch` | Branch atual |
+| `FREE/OK/ATN/WARN/CRIT [bar] pct% (Xtok)` | `show_context` | Nível de alerta, barra e % da janela de contexto |
+| `5h: X%` | `show_5h` | Uso do rate limit de 5h |
+| `reset HH:MM` | `show_reset` | Horário de reset do rate limit |
+| `Week: X%` | `show_week` | Uso do rate limit semanal |
+| `$X.XXX` | `show_cost` | Custo total da sessão (relevante para planos de API) |
+| `model` | `show_model` | Modelo em uso |
+
+---
+
+## Configuração do display
+
+O arquivo `.claude/monitor-config.json` controla quais campos aparecem na barra de status. É criado automaticamente pelo instalador com todos os campos habilitados.
+
+```json
+{
+  "show_repo":    true,
+  "show_branch":  true,
+  "show_context": true,
+  "show_5h":      true,
+  "show_reset":   true,
+  "show_week":    true,
+  "show_cost":    true,
+  "show_model":   true
+}
+```
+
+Basta editar o arquivo e salvar — a mudança entra em vigor na próxima mensagem, sem reiniciar o Claude Code. Reinstalar não sobrescreve o arquivo se ele já existir.
 
 Quando um save é acionado, uma linha extra aparece acima da barra:
 
