@@ -1,6 +1,9 @@
 # Claude Code local settings and runtime state
 .claude/settings.local.json
 .claude/threshold-state.json
+.claude/context-saves.log
+.claude/statusline-dump.json
+.claude/save-done.txt
 
 # Temporary files
 prompt.md
