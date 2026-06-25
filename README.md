@@ -2,26 +2,27 @@
 
 Sistema de monitoramento de tokens para Claude Code CLI com save-context automático.
 
-> Salva `CONTEXT.md` automaticamente em 70%, 85% e 95% de uso da janela de contexto — usando o mesmo cálculo interno do Claude Code (inclui tokens de cache).
-
 ---
 
 ## Funcionalidades
 
 **Barra de status em tempo real**
-- Exibe porcentagem de uso da janela de contexto (idêntica ao indicador interno do Claude Code)
+- Porcentagem de uso da janela de contexto, alinhada ao indicador interno do Claude Code
 - Barra de progresso colorida: verde → amarelo → vermelho
-- Uso de tokens nas últimas 5h e na semana, horário de reset, custo e modelo
+- Uso de rate limit nas últimas 5h e na semana, horário de reset, custo e modelo
 
 **Save-context automático**
-- Dispara em 70%, 85% e 95% de uso — a partir do threshold (ex: se pular de 60% para 87%, dispara em 85%)
+- Dispara em 70%, 85% e 95% de uso
+- Se o uso pular de 60% para 87%, dispara apenas em 85% (evita duplicatas)
 - Antes de compactação automática de sessão (pre-compact hook)
 - Manualmente via `/save-context`
+- Notificação visível no status bar quando o save é acionado e quando conclui
 
 **Porcentagem precisa**
-- Calcula `ceil((input + output + cache_write + cache_read) / budget_tokens × 100)`
-- Sem distorção por omissão de tokens de cache (o campo `used_percentage` do payload omite cache)
-- Fallback para `used_percentage` se `budget_tokens` não estiver disponível no payload
+- Usa `Max(calcPct, apiPct)`:
+  - `calcPct = ceil((input + output + cache_write + cache_read) / budget_tokens × 100)`
+  - `apiPct = used_percentage` do payload (calculado pelo próprio Claude Code)
+- `budget_tokens` representa o context window completo, mas o Claude Code compacta antes de esgotá-lo; `used_percentage` reflete o budget efetivo — tomamos o maior dos dois para nunca subestimar
 
 **Sem dependências extras**
 - Windows: PowerShell 5.1+ (nativo)
@@ -63,6 +64,7 @@ seu-projeto/
 │   ├── settings.json               ← statusLine + hooks (versionado)
 │   ├── threshold-state.json        ← Estado dos thresholds (runtime, gitignore)
 │   ├── context-saves.log           ← Log de saves (runtime, gitignore)
+│   ├── save-done.txt               ← Marcador temporário de conclusão de save (runtime)
 │   ├── commands/
 │   │   └── save-context.md         ← Slash command /save-context
 │   └── hooks/
@@ -88,8 +90,20 @@ token_monitor (master) | ATN [##########----------] 73% (180k) | 5h: 45%  reset 
 | `[bar] pct% (Xtok)` | % da janela de contexto usada + total de tokens (inclui cache) |
 | `5h: X%  reset HH:MM` | Uso do rate limit de 5h e horário de reset |
 | `Week: X%` | Uso do rate limit semanal |
-| `$X.XXX` | Custo total da sessão |
+| `$X.XXX` | Custo total da sessão (relevante para planos de API) |
 | `model` | Modelo em uso |
+
+Quando um save é acionado, uma linha extra aparece acima da barra:
+
+```
+Saving CONTEXT.md (85% used, trigger: threshold_85pct_used)...
+```
+
+Na mensagem seguinte, após a conclusão:
+
+```
+CONTEXT.md saved at 14:22:07
+```
 
 ---
 
@@ -97,7 +111,7 @@ token_monitor (master) | ATN [##########----------] 73% (180k) | 5h: 45%  reset 
 
 O estado dos thresholds é persistido em `.claude/threshold-state.json`. A cada mensagem:
 
-1. Calcula `pct` a partir de todos os tokens + `budget_tokens`
+1. Calcula `pct = Max(calcPct, apiPct)`
 2. Verifica se algum threshold novo foi ultrapassado (≥ não apenas =)
 3. Dispara o threshold mais alto atingido e marca os menores como feitos
 4. Se `pct` volta abaixo de 5% após ter sido > 20%, considera nova sessão e reseta o estado
@@ -116,12 +130,12 @@ lastPct=65%  →  pct=87%
 ```markdown
 ---
 trigger: threshold_85pct_used
-saved_at: 2026-06-24T14:22:10Z
+saved_at: 2026-06-25T14:22:10Z
 ---
 
 # Context -- meu-projeto
 
-> Saved at: 2026-06-24T14:22:10Z
+> Saved at: 2026-06-25T14:22:10Z
 > Trigger: threshold_85pct_used
 
 ## Git Log (last 15)
@@ -162,11 +176,7 @@ Para inspecionar o payload bruto que o Claude Code envia ao hook:
 # O payload fica salvo em .claude/statusline-dump.json
 ```
 
-```bash
-# Unix: equivalente com dump-hook.sh
-```
-
-O dump é útil para verificar os campos disponíveis no payload (`budget_tokens`, `cache_creation_input_tokens`, etc.) e confirmar que o cálculo de porcentagem está correto.
+Útil para verificar os campos disponíveis (`budget_tokens`, `used_percentage`, `cache_creation_input_tokens`, etc.) e confirmar que o cálculo está correto.
 
 ---
 
@@ -178,12 +188,11 @@ O dump é útil para verificar os campos disponíveis no payload (`budget_tokens
 
 **CONTEXT.md não é gerado ao atingir threshold**
 - Verifique `.claude/context-saves.log` para confirmar se o save foi executado
-- Certifique-se de que o projeto tem um diretório `.git` (o hook resolve os paths via `$PSScriptRoot`)
-- No Windows, confira se a ExecutionPolicy permite executar scripts PowerShell
+- No Windows, confirme que a ExecutionPolicy permite executar scripts PowerShell
 
 **Porcentagem diferente do indicador interno do Claude Code**
-- Certifique-se de estar usando a versão v3 mais recente (o campo `budget_tokens` do payload precisa estar presente)
-- Execute o dump-statusline para ver os campos disponíveis no payload da sua versão do Claude Code
+- A partir da v3.2, o monitor usa `Max(calcPct, used_percentage)` para nunca subestimar
+- Se ainda houver discrepância, execute o dump-statusline para ver os campos do payload
 
 **Reinstalar / atualizar**
 ```powershell
@@ -204,5 +213,5 @@ O installer remove o `threshold-state.json` existente, então os thresholds disp
 
 ---
 
-**Versão**: 3.1  
+**Versão**: 3.2  
 **Plataformas**: Windows (PowerShell), Linux/macOS (bash)

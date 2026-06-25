@@ -20,11 +20,12 @@ $tokCacheWrite = if ($null -ne $json.context_window.cache_creation_input_tokens)
 $tokCacheRead  = if ($null -ne $json.context_window.cache_read_input_tokens)     { [long]$json.context_window.cache_read_input_tokens }     else { 0 }
 $tokensUsed    = $tokInput + $tokOutput + $tokCacheWrite + $tokCacheRead
 
-$pct = if ($budgetTokens -gt 0) {
-    [int][math]::Ceiling($tokensUsed * 100.0 / $budgetTokens)
-} elseif ($null -ne $json.context_window.used_percentage) {
-    [int]$json.context_window.used_percentage
-} else { 0 }
+# Take the higher of our calculation and the API's own used_percentage.
+# budget_tokens = full context window size, but Claude Code compacts earlier;
+# used_percentage reflects the effective budget — so we must not go below it.
+$apiPct  = if ($null -ne $json.context_window.used_percentage) { [int]$json.context_window.used_percentage } else { 0 }
+$calcPct = if ($budgetTokens -gt 0) { [int][math]::Ceiling($tokensUsed * 100.0 / $budgetTokens) } else { 0 }
+$pct     = [Math]::Max($calcPct, $apiPct)
 
 $cost  = if ($null -ne $json.cost.total_cost_usd) { $json.cost.total_cost_usd } else { 0 }
 $model = if ($json.model.display_name) { $json.model.display_name } else { "Claude" }
@@ -54,6 +55,15 @@ if ($projectDir -and (Test-Path "$projectDir\.git")) {
 $hooksDir    = $PSScriptRoot                     # .claude/hooks/
 $claudeDir   = Split-Path $PSScriptRoot -Parent  # .claude/
 $projectRoot = Split-Path $claudeDir -Parent     # project root
+
+$saveDoneFile = Join-Path $claudeDir "save-done.txt"
+$saveNotify = ""
+if (Test-Path $saveDoneFile) {
+    try {
+        $saveNotify = "CONTEXT.md saved at " + (Get-Content $saveDoneFile -Raw).Trim()
+        Remove-Item $saveDoneFile -Force -ErrorAction SilentlyContinue
+    } catch {}
+}
 
 $stateFile = Join-Path $claudeDir "threshold-state.json"
 $state = @{ t70 = $false; t85 = $false; t95 = $false; lastPct = 0 }
@@ -89,6 +99,7 @@ if (-not (Test-Path $claudeDir)) { New-Item -ItemType Directory -Path $claudeDir
 $state | ConvertTo-Json | Out-File $stateFile -Encoding UTF8 -Force
 
 if ($trigger) {
+    $saveNotify = "Saving CONTEXT.md (${pct}% used, trigger: $trigger)..."
     $saveScript = Join-Path $hooksDir "save-context.ps1"
     Start-Process powershell -ArgumentList @(
         "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
@@ -139,4 +150,5 @@ $parts += "$e[34mWeek: ${pctWeek}%$reset"
 $parts += "$e[33m${costStr}$reset"
 $parts += "$e[36m${model}$reset"
 
+if ($saveNotify) { Write-Host $saveNotify }
 Write-Host ($parts -join " ${dim}|$reset ")

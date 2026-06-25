@@ -70,4 +70,7 @@ $logDir = Join-Path $ProjectRoot ".claude"
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 "[$timestamp] CONTEXT.md saved | trigger: $Trigger" | Add-Content (Join-Path $logDir "context-saves.log")
 
+# Write completion marker so statusline-monitor can display a notification
+(Get-Date -Format "HH:mm:ss") | Out-File (Join-Path $logDir "save-done.txt") -Encoding UTF8 -Force
+
 Write-Host "CONTEXT.md saved at $timestamp (trigger: $Trigger)"

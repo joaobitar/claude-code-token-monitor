@@ -8,7 +8,7 @@ Sistema de monitoramento de tokens para Claude Code CLI. Instala hooks que:
 3. Salvam `CONTEXT.md` antes de compactação automática de sessão (pre-compact hook)
 4. Disponibilizam o slash command `/save-context` para save manual
 
-**Versão atual**: 3.1 — estável, publicada, sem mudanças pendentes.
+**Versão atual**: 3.2 — estável, publicada, sem mudanças pendentes.
 
 ---
 
@@ -19,14 +19,14 @@ token_monitor/
 ├── install-v3.ps1                    ← Instalador Windows (escreve todos os arquivos abaixo)
 ├── install-v3.sh                     ← Instalador Linux/macOS
 ├── README.md                         ← Documentação completa
-├── QUICKSTART.md                     ← Guia rápido
-├── WINDOWS-INSTALL.md                ← Instruções Windows
 ├── CONTEXT.md                        ← Estado atual do projeto (gerado/atualizado)
-├── dump-statusline.ps1               ← Diagnóstico: despeja payload bruto
+├── dump-statusline.ps1               ← Diagnóstico: despeja payload bruto do statusLine
+├── dump-hook.ps1                     ← Diagnóstico: despeja payload bruto de Stop hook
 └── .claude/
     ├── settings.json                 ← statusLine + hooks (versionado)
     ├── threshold-state.json          ← Estado runtime dos thresholds (gitignored)
     ├── context-saves.log             ← Log de saves (gitignored)
+    ├── save-done.txt                 ← Marcador temporário de conclusão de save (runtime)
     ├── hooks/
     │   ├── statusline-monitor.ps1   ← Status bar + threshold check (ponto central)
     │   ├── save-context.ps1         ← Lógica compartilhada de geração do CONTEXT.md
@@ -70,10 +70,12 @@ Claude Code (/save-context)
 ### Cálculo de porcentagem
 
 ```
-pct = ceil((total_input_tokens + total_output_tokens + cache_creation_input_tokens + cache_read_input_tokens) / budget_tokens × 100)
+calcPct = ceil((total_input_tokens + total_output_tokens + cache_creation_input_tokens + cache_read_input_tokens) / budget_tokens × 100)
+apiPct  = used_percentage  (campo do payload, calculado internamente pelo Claude Code)
+pct     = Max(calcPct, apiPct)
 ```
 
-Fallback para `used_percentage` quando `budget_tokens` não está no payload. O campo `used_percentage` omite cache tokens e daria leitura menor que o indicador interno do Claude Code.
+`budget_tokens` representa o context window completo (ex: 200k), mas o Claude Code compacta antes de esgotá-lo. `used_percentage` reflete o budget efetivo — tomamos o maior dos dois para nunca subestimar o uso real. Antes da v3.2, apenas `calcPct` era usado, o que gerava disparidade de ~15pp.
 
 ### Resolução de paths
 
@@ -85,6 +87,15 @@ $projectRoot = Split-Path $claudeDir -Parent     # raiz do projeto
 ```
 
 Nunca use `Get-Location` ou paths do payload JSON para escrever arquivos — são não-confiáveis.
+
+### Notificação de save-context
+
+Quando um threshold dispara, `statusline-monitor.ps1` imprime uma linha extra acima da barra de status:
+```
+Saving CONTEXT.md (85% used, trigger: threshold_85pct_used)...
+```
+
+Quando `save-context.ps1` conclui, escreve `.claude/save-done.txt` com o horário (`HH:mm:ss`). Na próxima invocação do status bar, o arquivo é lido, exibido como `CONTEXT.md saved at HH:MM:SS`, e deletado.
 
 ### Stop hook é mínimo
 
