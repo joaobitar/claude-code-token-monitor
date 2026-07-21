@@ -16,7 +16,7 @@ Analise o estado atual do projeto e gere/atualize o arquivo `CONTEXT.md` na raiz
 
 # Context â€” [nome do projeto]
 > Salvo em: [data e hora atual]
-> Trigger: [manual | threshold_70pct | threshold_85pct | threshold_95pct | pre_compact]
+> Trigger: [manual | threshold_70pct | threshold_85pct | threshold_95pct | threshold_5h_ratelimit | pre_compact]
 
 ## Status atual
 [O que estÃ¡ funcionando e foi concluÃ­do]

@@ -4,6 +4,7 @@
 .claude/context-saves.log
 .claude/statusline-dump.json
 .claude/save-done.txt
+.claude/pending-5h-alert.json
 
 # Temporary files
 prompt.md

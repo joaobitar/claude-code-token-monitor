@@ -155,17 +155,33 @@ PCT=${PCT%.*}
 # Threshold check and save-context
 CLAUDE_DIR="$PROJECT_DIR/.claude"
 STATE_FILE="$CLAUDE_DIR/threshold-state.json"
+CFG_FILE="$CLAUDE_DIR/monitor-config.json"
 HOOKS_DIR_LOCAL="$CLAUDE_DIR/hooks"
-t70=false; t85=false; t95=false; last_pct=0
+t70=false; t85=false; t95=false; last_pct=0; t5h=false; last_5h_resets_at=0
 if [ -f "$STATE_FILE" ] && command -v python3 &>/dev/null; then
-    read -r t70 t85 t95 last_pct <<< "$(python3 - "$STATE_FILE" <<'PY'
+    read -r t70 t85 t95 last_pct t5h last_5h_resets_at <<< "$(python3 - "$STATE_FILE" <<'PY'
 import sys, json
 try:
     with open(sys.argv[1]) as f: s = json.load(f)
     print(str(s.get("t70","false")).lower(), str(s.get("t85","false")).lower(),
-          str(s.get("t95","false")).lower(), int(s.get("lastPct",0)))
+          str(s.get("t95","false")).lower(), int(s.get("lastPct",0)),
+          str(s.get("t5h","false")).lower(), int(s.get("last5hResetsAt",0)))
 except Exception:
-    print("false false false 0")
+    print("false false false 0 false 0")
+PY
+    )"
+fi
+
+# 5h rate-limit alert flags (default: enabled, 96%) from monitor-config.json
+save_on_5h=true; threshold_5h=96
+if [ -f "$CFG_FILE" ] && command -v python3 &>/dev/null; then
+    read -r save_on_5h threshold_5h <<< "$(python3 - "$CFG_FILE" <<'PY'
+import sys, json
+try:
+    with open(sys.argv[1]) as f: c = json.load(f)
+    print(str(c.get("save_on_5h_threshold", True)).lower(), int(c.get("rate_limit_5h_threshold_pct", 96)))
+except Exception:
+    print("true 96")
 PY
     )"
 fi
@@ -179,16 +195,49 @@ elif [ "$PCT" -ge 85 ] && [ "$t85" = "false" ]; then           t85=true; t70=tru
 elif [ "$PCT" -ge 70 ] && [ "$t70" = "false" ]; then                     t70=true; TRIGGER="threshold_70pct_used"
 fi
 
+# A new 5h window is detected by resets_at changing; that's what re-arms t5h,
+# since pct5h alone can dip and climb without a window actually resetting.
+if [ "${RESETS_AT:-0}" -gt 0 ] 2>/dev/null && [ "$last_5h_resets_at" -gt 0 ] 2>/dev/null && [ "$RESETS_AT" != "$last_5h_resets_at" ]; then
+    t5h=false
+fi
+[ "${RESETS_AT:-0}" -gt 0 ] 2>/dev/null && last_5h_resets_at="$RESETS_AT"
+
+TRIGGER_5H=false
+if [ "$save_on_5h" = "true" ] && [ "${PCT_5H:-0}" -ge "$threshold_5h" ] 2>/dev/null && [ "$t5h" = "false" ]; then
+    t5h=true
+    TRIGGER_5H=true
+fi
+
 if command -v python3 &>/dev/null; then
     python3 -c "
-import json
-s = {'t70': $( [ "$t70" = "true" ] && echo 'True' || echo 'False' ), 't85': $( [ "$t85" = "true" ] && echo 'True' || echo 'False' ), 't95': $( [ "$t95" = "true" ] && echo 'True' || echo 'False' ), 'lastPct': $PCT}
-import os; os.makedirs('$CLAUDE_DIR', exist_ok=True)
+import json, os
+s = {
+    't70': $( [ "$t70" = "true" ] && echo 'True' || echo 'False' ),
+    't85': $( [ "$t85" = "true" ] && echo 'True' || echo 'False' ),
+    't95': $( [ "$t95" = "true" ] && echo 'True' || echo 'False' ),
+    'lastPct': $PCT,
+    't5h': $( [ "$t5h" = "true" ] && echo 'True' || echo 'False' ),
+    'last5hResetsAt': $last_5h_resets_at,
+}
+os.makedirs('$CLAUDE_DIR', exist_ok=True)
 with open('$STATE_FILE','w') as f: json.dump(s, f)
 " 2>/dev/null || true
 fi
 
 [ -n "$TRIGGER" ] && "$HOOKS_DIR_LOCAL/save-context.sh" "$TRIGGER" "$PROJECT_DIR" &
+
+if [ "$TRIGGER_5H" = "true" ]; then
+    "$HOOKS_DIR_LOCAL/save-context.sh" "threshold_5h_ratelimit" "$PROJECT_DIR" &
+    # Leaves a marker for stop-hook.sh, which is the only hook Claude Code
+    # actually feeds back to the model - statusline output here is terminal-only.
+    if command -v python3 &>/dev/null; then
+        python3 -c "
+import json
+a = {'pct5h': $PCT_5H, 'threshold': $threshold_5h, 'resetsAt': ${RESETS_AT:-0}, 'resetStr': '$RESET_STR'}
+with open('$CLAUDE_DIR/pending-5h-alert.json', 'w') as f: json.dump(a, f)
+" 2>/dev/null || true
+    fi
+fi
 
 # ANSI colors
 ESC=$'\e'
@@ -344,14 +393,127 @@ chmod +x "$HOOKS_DIR/pre-compact.sh"
 echo "      pre-compact.sh"
 
 # ---- stop-hook.sh ----
-# Note: stop-hook JSON does NOT include context_window data.
-# Threshold checking and save-context are handled by statusline-monitor.sh.
+# Note: Stop hook JSON does NOT include context_window/rate_limits data, so
+# threshold checking still happens in statusline-monitor.sh. But statusline
+# output is terminal-only and invisible to the model, while this hook's
+# stdout IS fed back to Claude. So when statusline-monitor.sh crosses the 5h
+# rate-limit threshold, it drops pending-5h-alert.json; this hook picks it up
+# and blocks the stop with a reason, forcing Claude to relay the warning and
+# ask about scheduling a restart before yielding back to the user.
 cat > "$HOOKS_DIR/stop-hook.sh" << 'HOOK_EOF'
 #!/usr/bin/env bash
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+CLAUDE_DIR="$(dirname "$SELF_DIR")"
+ALERT_FILE="$CLAUDE_DIR/pending-5h-alert.json"
+
+if [ -f "$ALERT_FILE" ] && command -v python3 &>/dev/null; then
+    python3 - "$ALERT_FILE" <<'PY'
+import json, sys, os
+alert_file = sys.argv[1]
+try:
+    with open(alert_file) as f:
+        a = json.load(f)
+    os.remove(alert_file)
+    reason = (
+        f"Uso de tokens do intervalo de 5 horas atingiu {a.get('pct5h')}% "
+        f"(limite configurado: {a.get('threshold')}%). O CONTEXT.md ja foi salvo "
+        "automaticamente (trigger: threshold_5h_ratelimit). Informe o usuario que "
+        "o uso esta proximo do limite da janela de 5h e pergunte se deseja agendar "
+        f"um reinicio automatico, sugerindo o horario do proximo reset: {a.get('resetStr')}."
+    )
+    print(json.dumps({"decision": "block", "reason": reason}))
+except Exception:
+    pass
+PY
+fi
+
 exit 0
 HOOK_EOF
 chmod +x "$HOOKS_DIR/stop-hook.sh"
 echo "      stop-hook.sh"
+
+# ---- post-worktree-sync.sh ----
+# Fires on PostToolUse for the native EnterWorktree tool. New worktrees under
+# .claude/worktrees/<name>/ get their own isolated project root with no
+# .claude/settings.json - so statusLine has nothing to run there and the
+# status bar goes blank for the duration the session stays in that worktree.
+# This copies hooks/commands/settings into the worktree so it keeps working.
+cat > "$HOOKS_DIR/post-worktree-sync.sh" << 'HOOK_EOF'
+#!/usr/bin/env bash
+raw=$(cat)
+[ -z "$raw" ] && exit 0
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+CLAUDE_DIR="$(dirname "$SELF_DIR")"
+PROJECT_ROOT="$(dirname "$CLAUDE_DIR")"
+CMDS_DIR="$CLAUDE_DIR/commands"
+SETTINGS_SRC="$CLAUDE_DIR/settings.json"
+CFG_SRC="$CLAUDE_DIR/monitor-config.json"
+
+command -v python3 &>/dev/null || exit 0
+
+WT_PATH=$(echo "$raw" | python3 -c "
+import json, sys, re
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+pat = re.compile(r'\.claude[\\\\/]worktrees[\\\\/]')
+def find(o, depth=0):
+    if depth > 6 or o is None: return None
+    if isinstance(o, str):
+        return o if pat.search(o) else None
+    if isinstance(o, list):
+        for item in o:
+            r = find(item, depth+1)
+            if r: return r
+        return None
+    if isinstance(o, dict):
+        for v in o.values():
+            r = find(v, depth+1)
+            if r: return r
+    return None
+r = find(d)
+if r: print(r)
+" 2>/dev/null)
+
+[ -z "$WT_PATH" ] && exit 0
+[ -d "$WT_PATH" ] || exit 0
+case "$WT_PATH" in
+    "$PROJECT_ROOT"*) ;;
+    *) exit 0 ;;
+esac
+
+WT_CLAUDE_DIR="$WT_PATH/.claude"
+WT_HOOKS_DIR="$WT_CLAUDE_DIR/hooks"
+WT_CMDS_DIR="$WT_CLAUDE_DIR/commands"
+
+# Idempotency: skip if already synced (e.g. re-entering an existing worktree).
+[ -f "$WT_HOOKS_DIR/statusline-monitor.sh" ] && exit 0
+
+mkdir -p "$WT_HOOKS_DIR" "$WT_CMDS_DIR"
+cp "$SELF_DIR"/*.sh "$WT_HOOKS_DIR/" 2>/dev/null
+chmod +x "$WT_HOOKS_DIR"/*.sh 2>/dev/null
+[ -d "$CMDS_DIR" ] && cp "$CMDS_DIR"/*.md "$WT_CMDS_DIR/" 2>/dev/null
+[ -f "$CFG_SRC" ] && cp "$CFG_SRC" "$WT_CLAUDE_DIR/monitor-config.json"
+
+if [ -f "$SETTINGS_SRC" ]; then
+    if [ -f "$WT_CLAUDE_DIR/settings.json" ]; then
+        python3 - "$SETTINGS_SRC" "$WT_CLAUDE_DIR/settings.json" <<'PY' 2>/dev/null || cp "$SETTINGS_SRC" "$WT_CLAUDE_DIR/settings.json"
+import json, sys
+with open(sys.argv[1]) as f: src = json.load(f)
+with open(sys.argv[2]) as f: dst = json.load(f)
+dst["statusLine"] = src.get("statusLine", {})
+dst["hooks"] = src.get("hooks", {})
+with open(sys.argv[2], "w") as f: json.dump(dst, f, indent=2)
+PY
+    else
+        cp "$SETTINGS_SRC" "$WT_CLAUDE_DIR/settings.json"
+    fi
+fi
+HOOK_EOF
+chmod +x "$HOOKS_DIR/post-worktree-sync.sh"
+echo "      post-worktree-sync.sh"
 echo "[OK] All hook scripts created"
 
 # -----------------------------------------------------------------------
@@ -378,7 +540,7 @@ Analise o estado atual do projeto e gere/atualize o arquivo `CONTEXT.md` na raiz
 
 # Context — [nome do projeto]
 > Salvo em: [data e hora atual]
-> Trigger: [manual | threshold_70pct | threshold_85pct | threshold_95pct | pre_compact]
+> Trigger: [manual | threshold_70pct | threshold_85pct | threshold_95pct | threshold_5h_ratelimit | pre_compact]
 
 ## Status atual
 [O que está funcionando e foi concluído]
@@ -429,6 +591,7 @@ s["statusLine"] = {"type": "command", "command": "bash .claude/hooks/statusline-
 s.setdefault("hooks", {})
 s["hooks"]["PreCompact"] = [{"hooks": [{"type": "command", "command": "bash .claude/hooks/pre-compact.sh"}]}]
 s["hooks"]["Stop"]       = [{"hooks": [{"type": "command", "command": "bash .claude/hooks/stop-hook.sh"}]}]
+s["hooks"]["PostToolUse"] = [{"matcher": "EnterWorktree", "hooks": [{"type": "command", "command": "bash .claude/hooks/post-worktree-sync.sh"}]}]
 
 with open(sys.argv[1], "w") as f:
     json.dump(s, f, indent=2)
@@ -462,6 +625,17 @@ else
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "EnterWorktree",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/post-worktree-sync.sh"
+          }
+        ]
+      }
     ]
   }
 }
@@ -474,7 +648,7 @@ fi
 # -----------------------------------------------------------------------
 echo "[6/6] Updating .gitignore..."
 GITIGNORE="$ROOT/.gitignore"
-ENTRIES=(".claude/context-saves.log" ".claude/threshold-state.json" ".claude/usage-log.json")
+ENTRIES=(".claude/context-saves.log" ".claude/threshold-state.json" ".claude/usage-log.json" ".claude/pending-5h-alert.json")
 if [ -f "$GITIGNORE" ]; then
     ADDED=0
     for entry in "${ENTRIES[@]}"; do
@@ -503,15 +677,17 @@ echo ""
 echo "Created:"
 echo "  .claude/settings.json"
 echo "  .claude/hooks/statusline-monitor.sh   <- status bar"
-echo "  .claude/hooks/stop-hook.sh             <- saves at 70/85/95% used"
+echo "  .claude/hooks/stop-hook.sh             <- relays the 5h rate-limit alert to Claude"
 echo "  .claude/hooks/pre-compact.sh           <- saves before compaction"
 echo "  .claude/hooks/save-context.sh          <- shared save logic"
+echo "  .claude/hooks/post-worktree-sync.sh    <- copies monitor into new EnterWorktree worktrees"
 echo "  .claude/commands/save-context.md       <- /save-context slash command"
 echo ""
 echo "Status bar format:"
 echo "  repo (branch) | level [bar] pct% (Xtok) | 5h: Xtok (Y%) | Week: Xtok (Z%) | cost | model"
 echo ""
 echo "Thresholds: CONTEXT.md auto-saved when 70%, 85%, 95% of context is used"
+echo "5h rate-limit alert: default 96% (configurable via rate_limit_5h_threshold_pct in monitor-config.json)"
 echo "Manual save: /save-context"
 echo ""
 echo "Requirements: bash, git, jq or python3"

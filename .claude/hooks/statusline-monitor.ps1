@@ -46,7 +46,7 @@ if ($projectDir -and (Test-Path "$projectDir\.git")) {
     } catch {}
 }
 
-# -- Threshold check (save-context at 70/85/95%) --
+# -- Threshold check (save-context at 70/85/95%, plus the 5h rate-limit alert) --
 # Use $PSScriptRoot (absolute) so paths are reliable regardless of cwd or payload content
 $hooksDir    = $PSScriptRoot                     # .claude/hooks/
 $claudeDir   = Split-Path $PSScriptRoot -Parent  # .claude/
@@ -61,15 +61,30 @@ if (Test-Path $saveDoneFile) {
     } catch {}
 }
 
+# -- Display config (also holds the 5h-threshold feature flags) --
+$cfgFile = Join-Path $claudeDir "monitor-config.json"
+$cfg = @{ show_repo=$true; show_branch=$true; show_context=$true; show_5h=$true; show_reset=$true; show_week=$true; show_cost=$true; show_model=$true; save_on_5h_threshold=$true; rate_limit_5h_threshold_pct=96 }
+if (Test-Path $cfgFile) {
+    try {
+        $c = Get-Content $cfgFile -Raw | ConvertFrom-Json
+        foreach ($k in @('show_repo','show_branch','show_context','show_5h','show_reset','show_week','show_cost','show_model','save_on_5h_threshold')) {
+            if ($null -ne $c.$k) { $cfg[$k] = [bool]$c.$k }
+        }
+        if ($null -ne $c.rate_limit_5h_threshold_pct) { $cfg['rate_limit_5h_threshold_pct'] = [int]$c.rate_limit_5h_threshold_pct }
+    } catch {}
+}
+
 $stateFile = Join-Path $claudeDir "threshold-state.json"
-$state = @{ t70 = $false; t85 = $false; t95 = $false; lastPct = 0 }
+$state = @{ t70 = $false; t85 = $false; t95 = $false; lastPct = 0; t5h = $false; last5hResetsAt = 0 }
 if (Test-Path $stateFile) {
     try {
         $s = Get-Content $stateFile -Raw | ConvertFrom-Json
-        if ($null -ne $s.t70)     { $state.t70     = [bool]$s.t70 }
-        if ($null -ne $s.t85)     { $state.t85     = [bool]$s.t85 }
-        if ($null -ne $s.t95)     { $state.t95     = [bool]$s.t95 }
-        if ($null -ne $s.lastPct) { $state.lastPct = [int]$s.lastPct }
+        if ($null -ne $s.t70)            { $state.t70            = [bool]$s.t70 }
+        if ($null -ne $s.t85)            { $state.t85            = [bool]$s.t85 }
+        if ($null -ne $s.t95)            { $state.t95            = [bool]$s.t95 }
+        if ($null -ne $s.lastPct)        { $state.lastPct        = [int]$s.lastPct }
+        if ($null -ne $s.t5h)            { $state.t5h            = [bool]$s.t5h }
+        if ($null -ne $s.last5hResetsAt) { $state.last5hResetsAt = [long]$s.last5hResetsAt }
     } catch {}
 }
 
@@ -91,20 +106,22 @@ if ($pct -ge 95 -and -not $state.t95) {
 }
 $state.lastPct = $pct
 
+# -- 5h rate-limit threshold (default 96%, configurable via rate_limit_5h_threshold_pct) --
+# A new 5h window is detected by resets_at changing; that's what re-arms t5h,
+# since pct5h alone can dip and climb without a window actually resetting.
+$trigger5h = $false
+if ($resetsAt -gt 0 -and $state.last5hResetsAt -gt 0 -and $resetsAt -ne $state.last5hResetsAt) {
+    $state.t5h = $false
+}
+if ($resetsAt -gt 0) { $state.last5hResetsAt = $resetsAt }
+
+if ($cfg.save_on_5h_threshold -and $pct5h -ge $cfg.rate_limit_5h_threshold_pct -and -not $state.t5h) {
+    $state.t5h = $true
+    $trigger5h = $true
+}
+
 if (-not (Test-Path $claudeDir)) { New-Item -ItemType Directory -Path $claudeDir -Force | Out-Null }
 $state | ConvertTo-Json | Out-File $stateFile -Encoding UTF8 -Force
-
-# -- Display config --
-$cfgFile = Join-Path $claudeDir "monitor-config.json"
-$cfg = @{ show_repo=$true; show_branch=$true; show_context=$true; show_5h=$true; show_reset=$true; show_week=$true; show_cost=$true; show_model=$true }
-if (Test-Path $cfgFile) {
-    try {
-        $c = Get-Content $cfgFile -Raw | ConvertFrom-Json
-        foreach ($k in @('show_repo','show_branch','show_context','show_5h','show_reset','show_week','show_cost','show_model')) {
-            if ($null -ne $c.$k) { $cfg[$k] = [bool]$c.$k }
-        }
-    } catch {}
-}
 
 if ($trigger) {
     $saveNotify = "Saving CONTEXT.md (${pct}% used, trigger: $trigger)..."
@@ -115,6 +132,27 @@ if ($trigger) {
         "-Trigger", $trigger,
         "-ProjectRoot", $projectRoot
     ) -WindowStyle Hidden
+}
+
+if ($trigger5h) {
+    $saveNotify = "5h rate limit at ${pct5h}% (reset ${resetStr}) - saving CONTEXT.md..."
+    $saveScript = Join-Path $hooksDir "save-context.ps1"
+    Start-Process powershell -ArgumentList @(
+        "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", $saveScript,
+        "-Trigger", "threshold_5h_ratelimit",
+        "-ProjectRoot", $projectRoot
+    ) -WindowStyle Hidden
+
+    # Leaves a marker for stop-hook.ps1, which is the only hook Claude Code
+    # actually feeds back to the model - statusLine output here is terminal-only.
+    $alertObj = [ordered]@{
+        pct5h     = $pct5h
+        threshold = $cfg.rate_limit_5h_threshold_pct
+        resetsAt  = $resetsAt
+        resetStr  = $resetStr
+    }
+    $alertObj | ConvertTo-Json | Out-File (Join-Path $claudeDir "pending-5h-alert.json") -Encoding UTF8 -Force
 }
 
 # -- Helpers --

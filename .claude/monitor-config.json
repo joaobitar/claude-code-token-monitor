@@ -5,6 +5,8 @@
   "show_5h":      true,
   "show_reset":   true,
   "show_week":    true,
-  "show_cost":    true,
-  "show_model":   true
+  "show_cost":    false,
+  "show_model":   true,
+  "save_on_5h_threshold":        true,
+  "rate_limit_5h_threshold_pct": 96
 }

@@ -74,7 +74,9 @@ if (-not (Test-Path $cfgFile)) {
   "show_reset":   true,
   "show_week":    true,
   "show_cost":    true,
-  "show_model":   true
+  "show_model":   true,
+  "save_on_5h_threshold":        true,
+  "rate_limit_5h_threshold_pct": 96
 }
 '@ | Out-File $cfgFile -Encoding UTF8
     Write-Host "[OK] .claude/monitor-config.json created with defaults" -ForegroundColor Green
@@ -139,7 +141,7 @@ if ($projectDir -and (Test-Path "$projectDir\.git")) {
     } catch {}
 }
 
-# -- Threshold check (save-context at 70/85/95%) --
+# -- Threshold check (save-context at 70/85/95%, plus the 5h rate-limit alert) --
 # Use $PSScriptRoot (absolute) so paths are reliable regardless of cwd or payload content
 $hooksDir    = $PSScriptRoot                     # .claude/hooks/
 $claudeDir   = Split-Path $PSScriptRoot -Parent  # .claude/
@@ -154,15 +156,30 @@ if (Test-Path $saveDoneFile) {
     } catch {}
 }
 
+# -- Display config (also holds the 5h-threshold feature flags) --
+$cfgFile = Join-Path $claudeDir "monitor-config.json"
+$cfg = @{ show_repo=$true; show_branch=$true; show_context=$true; show_5h=$true; show_reset=$true; show_week=$true; show_cost=$true; show_model=$true; save_on_5h_threshold=$true; rate_limit_5h_threshold_pct=96 }
+if (Test-Path $cfgFile) {
+    try {
+        $c = Get-Content $cfgFile -Raw | ConvertFrom-Json
+        foreach ($k in @('show_repo','show_branch','show_context','show_5h','show_reset','show_week','show_cost','show_model','save_on_5h_threshold')) {
+            if ($null -ne $c.$k) { $cfg[$k] = [bool]$c.$k }
+        }
+        if ($null -ne $c.rate_limit_5h_threshold_pct) { $cfg['rate_limit_5h_threshold_pct'] = [int]$c.rate_limit_5h_threshold_pct }
+    } catch {}
+}
+
 $stateFile = Join-Path $claudeDir "threshold-state.json"
-$state = @{ t70 = $false; t85 = $false; t95 = $false; lastPct = 0 }
+$state = @{ t70 = $false; t85 = $false; t95 = $false; lastPct = 0; t5h = $false; last5hResetsAt = 0 }
 if (Test-Path $stateFile) {
     try {
         $s = Get-Content $stateFile -Raw | ConvertFrom-Json
-        if ($null -ne $s.t70)     { $state.t70     = [bool]$s.t70 }
-        if ($null -ne $s.t85)     { $state.t85     = [bool]$s.t85 }
-        if ($null -ne $s.t95)     { $state.t95     = [bool]$s.t95 }
-        if ($null -ne $s.lastPct) { $state.lastPct = [int]$s.lastPct }
+        if ($null -ne $s.t70)            { $state.t70            = [bool]$s.t70 }
+        if ($null -ne $s.t85)            { $state.t85            = [bool]$s.t85 }
+        if ($null -ne $s.t95)            { $state.t95            = [bool]$s.t95 }
+        if ($null -ne $s.lastPct)        { $state.lastPct        = [int]$s.lastPct }
+        if ($null -ne $s.t5h)            { $state.t5h            = [bool]$s.t5h }
+        if ($null -ne $s.last5hResetsAt) { $state.last5hResetsAt = [long]$s.last5hResetsAt }
     } catch {}
 }
 
@@ -184,20 +201,22 @@ if ($pct -ge 95 -and -not $state.t95) {
 }
 $state.lastPct = $pct
 
+# -- 5h rate-limit threshold (default 96%, configurable via rate_limit_5h_threshold_pct) --
+# A new 5h window is detected by resets_at changing; that's what re-arms t5h,
+# since pct5h alone can dip and climb without a window actually resetting.
+$trigger5h = $false
+if ($resetsAt -gt 0 -and $state.last5hResetsAt -gt 0 -and $resetsAt -ne $state.last5hResetsAt) {
+    $state.t5h = $false
+}
+if ($resetsAt -gt 0) { $state.last5hResetsAt = $resetsAt }
+
+if ($cfg.save_on_5h_threshold -and $pct5h -ge $cfg.rate_limit_5h_threshold_pct -and -not $state.t5h) {
+    $state.t5h = $true
+    $trigger5h = $true
+}
+
 if (-not (Test-Path $claudeDir)) { New-Item -ItemType Directory -Path $claudeDir -Force | Out-Null }
 $state | ConvertTo-Json | Out-File $stateFile -Encoding UTF8 -Force
-
-# -- Display config --
-$cfgFile = Join-Path $claudeDir "monitor-config.json"
-$cfg = @{ show_repo=$true; show_branch=$true; show_context=$true; show_5h=$true; show_reset=$true; show_week=$true; show_cost=$true; show_model=$true }
-if (Test-Path $cfgFile) {
-    try {
-        $c = Get-Content $cfgFile -Raw | ConvertFrom-Json
-        foreach ($k in @('show_repo','show_branch','show_context','show_5h','show_reset','show_week','show_cost','show_model')) {
-            if ($null -ne $c.$k) { $cfg[$k] = [bool]$c.$k }
-        }
-    } catch {}
-}
 
 if ($trigger) {
     $saveNotify = "Saving CONTEXT.md (${pct}% used, trigger: $trigger)..."
@@ -208,6 +227,27 @@ if ($trigger) {
         "-Trigger", $trigger,
         "-ProjectRoot", $projectRoot
     ) -WindowStyle Hidden
+}
+
+if ($trigger5h) {
+    $saveNotify = "5h rate limit at ${pct5h}% (reset ${resetStr}) - saving CONTEXT.md..."
+    $saveScript = Join-Path $hooksDir "save-context.ps1"
+    Start-Process powershell -ArgumentList @(
+        "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", $saveScript,
+        "-Trigger", "threshold_5h_ratelimit",
+        "-ProjectRoot", $projectRoot
+    ) -WindowStyle Hidden
+
+    # Leaves a marker for stop-hook.ps1, which is the only hook Claude Code
+    # actually feeds back to the model - statusLine output here is terminal-only.
+    $alertObj = [ordered]@{
+        pct5h     = $pct5h
+        threshold = $cfg.rate_limit_5h_threshold_pct
+        resetsAt  = $resetsAt
+        resetStr  = $resetStr
+    }
+    $alertObj | ConvertTo-Json | Out-File (Join-Path $claudeDir "pending-5h-alert.json") -Encoding UTF8 -Force
 }
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -359,14 +399,131 @@ try { $json = $raw | ConvertFrom-Json; if ($json.trigger) { $trigger = $json.tri
 Write-Host "      pre-compact.ps1" -ForegroundColor Gray
 
 # ---- stop-hook.ps1 ----
-# Note: stop-hook JSON does NOT include context_window data.
-# Threshold checking and save-context are handled by statusline-monitor.ps1.
-# This hook is kept only for pre-compact compatibility.
+# Note: Stop hook JSON does NOT include context_window/rate_limits data, so
+# threshold checking still happens in statusline-monitor.ps1. But statusLine
+# output is terminal-only and invisible to the model, while a Stop hook's
+# stdout IS fed back to Claude. So when statusline-monitor.ps1 crosses the 5h
+# rate-limit threshold, it drops pending-5h-alert.json; this hook picks it up
+# and blocks the stop with a reason, forcing Claude to relay the warning and
+# ask about scheduling a restart before yielding back to the user.
 @'
+[Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+$claudeDir = Split-Path $PSScriptRoot -Parent
+$alertFile = Join-Path $claudeDir "pending-5h-alert.json"
+
+if (Test-Path $alertFile) {
+    try {
+        $alert = Get-Content $alertFile -Raw | ConvertFrom-Json
+        Remove-Item $alertFile -Force -ErrorAction SilentlyContinue
+
+        $reason = "Uso de tokens do intervalo de 5 horas atingiu $($alert.pct5h)% (limite configurado: $($alert.threshold)%). O CONTEXT.md ja foi salvo automaticamente (trigger: threshold_5h_ratelimit). Informe o usuario que o uso esta proximo do limite da janela de 5h e pergunte se deseja agendar um reinicio automatico, sugerindo o horario do proximo reset: $($alert.resetStr)."
+
+        @{ decision = "block"; reason = $reason } | ConvertTo-Json -Compress | Write-Host
+        exit 0
+    } catch {}
+}
+
 exit 0
 '@ | Out-File (Join-Path $hooksDir "stop-hook.ps1") -Encoding UTF8
 
 Write-Host "      stop-hook.ps1" -ForegroundColor Gray
+
+# ---- post-worktree-sync.ps1 ----
+# Fires on PostToolUse for the native EnterWorktree tool. New worktrees under
+# .claude/worktrees/<name>/ get their own isolated project root with no
+# .claude/settings.json - so statusLine has nothing to run there and the
+# status bar goes blank for the duration the session stays in that worktree.
+# This copies hooks/commands/settings into the worktree so it keeps working.
+@'
+[Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+$raw = [Console]::In.ReadToEnd()
+if (-not $raw.Trim()) { exit 0 }
+try { $json = $raw | ConvertFrom-Json } catch { exit 0 }
+
+try {
+    # Source of truth is THIS project (script''s own location), regardless of cwd
+    # after EnterWorktree switched the session''s working directory.
+    $hooksDir    = $PSScriptRoot
+    $claudeDir   = Split-Path $PSScriptRoot -Parent
+    $projectRoot = Split-Path $claudeDir -Parent
+    $cmdsDir     = Join-Path $claudeDir "commands"
+    $settingsSrc = Join-Path $claudeDir "settings.json"
+    $cfgSrc      = Join-Path $claudeDir "monitor-config.json"
+
+    # Locate the worktree path anywhere in the payload (field name/shape not guaranteed).
+    function Find-WorktreePath($obj, [int]$depth = 0) {
+        if ($depth -gt 6 -or $null -eq $obj) { return $null }
+        if ($obj -is [string]) {
+            if ($obj -match ''\.claude[\\/]worktrees[\\/]'') { return $obj }
+            return $null
+        }
+        if ($obj -is [System.Collections.IEnumerable] -and -not ($obj -is [string])) {
+            foreach ($item in $obj) {
+                $r = Find-WorktreePath $item ($depth + 1)
+                if ($r) { return $r }
+            }
+            return $null
+        }
+        if ($obj.PSObject -and $obj.PSObject.Properties) {
+            foreach ($p in $obj.PSObject.Properties) {
+                $r = Find-WorktreePath $p.Value ($depth + 1)
+                if ($r) { return $r }
+            }
+        }
+        return $null
+    }
+
+    $wtPath = Find-WorktreePath $json
+    if (-not $wtPath) { exit 0 }
+    if (-not (Test-Path $wtPath)) { exit 0 }
+    if ($wtPath -notlike "$projectRoot*") { exit 0 }
+
+    $wtClaudeDir = Join-Path $wtPath ".claude"
+    $wtHooksDir  = Join-Path $wtClaudeDir "hooks"
+    $wtCmdsDir   = Join-Path $wtClaudeDir "commands"
+
+    # Idempotency: skip if already synced (e.g. re-entering an existing worktree).
+    if (Test-Path (Join-Path $wtHooksDir "statusline-monitor.ps1")) { exit 0 }
+
+    New-Item -ItemType Directory -Path $wtHooksDir -Force | Out-Null
+    New-Item -ItemType Directory -Path $wtCmdsDir  -Force | Out-Null
+
+    Get-ChildItem -Path $hooksDir -Filter "*.ps1" | ForEach-Object {
+        Copy-Item $_.FullName (Join-Path $wtHooksDir $_.Name) -Force
+    }
+    if (Test-Path $cmdsDir) {
+        Get-ChildItem -Path $cmdsDir -Filter "*.md" | ForEach-Object {
+            Copy-Item $_.FullName (Join-Path $wtCmdsDir $_.Name) -Force
+        }
+    }
+    if (Test-Path $cfgSrc) {
+        Copy-Item $cfgSrc (Join-Path $wtClaudeDir "monitor-config.json") -Force
+    }
+
+    $wtSettingsFile = Join-Path $wtClaudeDir "settings.json"
+    if (Test-Path $settingsSrc) {
+        $srcSettings = Get-Content $settingsSrc -Raw | ConvertFrom-Json
+        if (Test-Path $wtSettingsFile) {
+            try {
+                $existing = Get-Content $wtSettingsFile -Raw | ConvertFrom-Json
+                $existing | Add-Member -MemberType NoteProperty -Name "statusLine" -Value $srcSettings.statusLine -Force
+                $existing | Add-Member -MemberType NoteProperty -Name "hooks"      -Value $srcSettings.hooks      -Force
+                $existing | ConvertTo-Json -Depth 10 | Out-File $wtSettingsFile -Encoding UTF8 -Force
+            } catch {
+                Copy-Item $settingsSrc $wtSettingsFile -Force
+            }
+        } else {
+            Copy-Item $settingsSrc $wtSettingsFile -Force
+        }
+    }
+} catch {}
+'@ | Out-File (Join-Path $hooksDir "post-worktree-sync.ps1") -Encoding UTF8
+
+Write-Host "      post-worktree-sync.ps1" -ForegroundColor Gray
 Write-Host "[OK] All hook scripts created" -ForegroundColor Green
 
 # -----------------------------------------------------------------------
@@ -393,7 +550,7 @@ Analise o estado atual do projeto e gere/atualize o arquivo `CONTEXT.md` na raiz
 
 # Context — [nome do projeto]
 > Salvo em: [data e hora atual]
-> Trigger: [manual | threshold_70pct | threshold_85pct | threshold_95pct | pre_compact]
+> Trigger: [manual | threshold_70pct | threshold_85pct | threshold_95pct | threshold_5h_ratelimit | pre_compact]
 
 ## Status atual
 [O que está funcionando e foi concluído]
@@ -455,6 +612,17 @@ $newSettings = [ordered]@{
                 )
             }
         )
+        PostToolUse = @(
+            [ordered]@{
+                matcher = "EnterWorktree"
+                hooks = @(
+                    [ordered]@{
+                        type    = "command"
+                        command = 'powershell -NoProfile -NonInteractive -File ".claude\hooks\post-worktree-sync.ps1"'
+                    }
+                )
+            }
+        )
     }
 }
 
@@ -479,7 +647,7 @@ if (Test-Path $settings) {
 # -----------------------------------------------------------------------
 Write-Host "[6/6] Updating .gitignore..." -ForegroundColor Yellow
 $gitignore = Join-Path $root ".gitignore"
-$entries   = @(".claude/context-saves.log", ".claude/threshold-state.json", ".claude/usage-log.json")
+$entries   = @(".claude/context-saves.log", ".claude/threshold-state.json", ".claude/usage-log.json", ".claude/pending-5h-alert.json")
 if (Test-Path $gitignore) {
     $content = Get-Content $gitignore -Raw
     $toAdd   = $entries | Where-Object { $content -notlike "*$_*" }
@@ -505,14 +673,16 @@ Write-Host ""
 Write-Host "Created:"
 Write-Host "  .claude/settings.json"
 Write-Host "  .claude/hooks/statusline-monitor.ps1   <- status bar"
-Write-Host "  .claude/hooks/stop-hook.ps1             <- saves at 70/85/95% used"
+Write-Host "  .claude/hooks/stop-hook.ps1             <- relays the 5h rate-limit alert to Claude"
 Write-Host "  .claude/hooks/pre-compact.ps1           <- saves before compaction"
 Write-Host "  .claude/hooks/save-context.ps1          <- shared save logic"
+Write-Host "  .claude/hooks/post-worktree-sync.ps1    <- copies monitor into new EnterWorktree worktrees"
 Write-Host "  .claude/commands/save-context.md        <- /save-context slash command"
 Write-Host ""
 Write-Host "Status bar format:"
 Write-Host "  repo (branch) | level [bar] pct% (Xtok) | 5h: Xtok (Y%) | Week: Xtok (Z%) | cost | model"
 Write-Host ""
 Write-Host "Thresholds: CONTEXT.md auto-saved when 70%, 85%, 95% of context is used"
+Write-Host "5h rate-limit alert: default 96% (configurable via rate_limit_5h_threshold_pct in monitor-config.json)"
 Write-Host "Manual save: /save-context"
 Write-Host ""
