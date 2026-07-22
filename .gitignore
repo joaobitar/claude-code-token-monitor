@@ -11,3 +11,6 @@ prompt.md
 
 # Test runtime artifacts
 tests/TestResults.xml
+
+# Claude Code Token Monitor
+.claude/usage-log.json

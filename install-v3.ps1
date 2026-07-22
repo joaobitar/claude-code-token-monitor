@@ -61,27 +61,47 @@ New-Item -ItemType Directory -Path $cmdsDir  -Force | Out-Null
 Write-Host "[OK] Directories ready" -ForegroundColor Green
 
 # -----------------------------------------------------------------------
-# STEP 2b: monitor-config.json (only if not already present)
+# STEP 2b: monitor-config.json (create with defaults, or merge missing
+# fields into an existing file so reinstalls pick up new config keys
+# without wiping the user's existing customizations)
 # -----------------------------------------------------------------------
 $cfgFile = Join-Path $claudeDir "monitor-config.json"
-if (-not (Test-Path $cfgFile)) {
-    @'
-{
-  "show_repo":    true,
-  "show_branch":  true,
-  "show_context": true,
-  "show_5h":      true,
-  "show_reset":   true,
-  "show_week":    true,
-  "show_cost":    true,
-  "show_model":   true,
-  "save_on_5h_threshold":        true,
-  "rate_limit_5h_threshold_pct": 96
+$defaultCfg = [ordered]@{
+    show_repo                   = $true
+    show_branch                 = $true
+    show_context                = $true
+    show_5h                     = $true
+    show_reset                  = $true
+    show_week                   = $true
+    show_cost                   = $true
+    show_model                  = $true
+    save_on_5h_threshold        = $true
+    rate_limit_5h_threshold_pct = 96
 }
-'@ | Out-File $cfgFile -Encoding UTF8
+
+if (-not (Test-Path $cfgFile)) {
+    $defaultCfg | ConvertTo-Json | Out-File $cfgFile -Encoding UTF8
     Write-Host "[OK] .claude/monitor-config.json created with defaults" -ForegroundColor Green
 } else {
-    Write-Host "[OK] .claude/monitor-config.json kept (already exists)" -ForegroundColor Green
+    try {
+        $existing = Get-Content $cfgFile -Raw | ConvertFrom-Json
+        $existingKeys = $existing.PSObject.Properties.Name
+        $missing = @()
+        foreach ($key in $defaultCfg.Keys) {
+            if ($existingKeys -notcontains $key) {
+                $existing | Add-Member -MemberType NoteProperty -Name $key -Value $defaultCfg[$key]
+                $missing += $key
+            }
+        }
+        if ($missing.Count -gt 0) {
+            $existing | ConvertTo-Json | Out-File $cfgFile -Encoding UTF8
+            Write-Host "[OK] .claude/monitor-config.json updated with new fields: $($missing -join ', ')" -ForegroundColor Green
+        } else {
+            Write-Host "[OK] .claude/monitor-config.json kept (already up to date)" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "[WARN] .claude/monitor-config.json exists but could not be parsed - left untouched" -ForegroundColor Yellow
+    }
 }
 
 # -----------------------------------------------------------------------
@@ -586,10 +606,15 @@ Write-Host "[OK] .claude/commands/save-context.md created" -ForegroundColor Gree
 # -----------------------------------------------------------------------
 Write-Host "[5/6] Writing .claude/settings.json..." -ForegroundColor Yellow
 
+$statuslineHook   = Join-Path $hooksDir "statusline-monitor.ps1"
+$precompactHook   = Join-Path $hooksDir "pre-compact.ps1"
+$stopHook         = Join-Path $hooksDir "stop-hook.ps1"
+$worktreeSyncHook = Join-Path $hooksDir "post-worktree-sync.ps1"
+
 $newSettings = [ordered]@{
     statusLine = [ordered]@{
         type    = "command"
-        command = 'powershell -NoProfile -NonInteractive -File ".claude\hooks\statusline-monitor.ps1"'
+        command = "powershell -NoProfile -NonInteractive -File `"$statuslineHook`""
     }
     hooks = [ordered]@{
         PreCompact = @(
@@ -597,7 +622,7 @@ $newSettings = [ordered]@{
                 hooks = @(
                     [ordered]@{
                         type    = "command"
-                        command = 'powershell -NoProfile -NonInteractive -File ".claude\hooks\pre-compact.ps1"'
+                        command = "powershell -NoProfile -NonInteractive -File `"$precompactHook`""
                     }
                 )
             }
@@ -607,7 +632,7 @@ $newSettings = [ordered]@{
                 hooks = @(
                     [ordered]@{
                         type    = "command"
-                        command = 'powershell -NoProfile -NonInteractive -File ".claude\hooks\stop-hook.ps1"'
+                        command = "powershell -NoProfile -NonInteractive -File `"$stopHook`""
                     }
                 )
             }
@@ -618,7 +643,7 @@ $newSettings = [ordered]@{
                 hooks = @(
                     [ordered]@{
                         type    = "command"
-                        command = 'powershell -NoProfile -NonInteractive -File ".claude\hooks\post-worktree-sync.ps1"'
+                        command = "powershell -NoProfile -NonInteractive -File `"$worktreeSyncHook`""
                     }
                 )
             }

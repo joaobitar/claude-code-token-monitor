@@ -57,6 +57,58 @@ mkdir -p "$HOOKS_DIR" "$CMDS_DIR"
 echo "[OK] Directories ready"
 
 # -----------------------------------------------------------------------
+# STEP 2b: monitor-config.json (create with defaults, or merge missing
+# fields into an existing file so reinstalls pick up new config keys
+# without wiping the user's existing customizations)
+# -----------------------------------------------------------------------
+CFG_FILE_INSTALL="$CLAUDE_DIR/monitor-config.json"
+if [ ! -f "$CFG_FILE_INSTALL" ]; then
+    cat > "$CFG_FILE_INSTALL" << 'CFG_EOF'
+{
+  "show_repo":    true,
+  "show_branch":  true,
+  "show_context": true,
+  "show_5h":      true,
+  "show_reset":   true,
+  "show_week":    true,
+  "show_cost":    true,
+  "show_model":   true,
+  "save_on_5h_threshold":        true,
+  "rate_limit_5h_threshold_pct": 96
+}
+CFG_EOF
+    echo "[OK] .claude/monitor-config.json created with defaults"
+elif command -v python3 &>/dev/null; then
+    python3 - "$CFG_FILE_INSTALL" <<'PY'
+import json, sys
+path = sys.argv[1]
+defaults = {
+    "show_repo": True, "show_branch": True, "show_context": True,
+    "show_5h": True, "show_reset": True, "show_week": True,
+    "show_cost": True, "show_model": True,
+    "save_on_5h_threshold": True, "rate_limit_5h_threshold_pct": 96,
+}
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except Exception:
+    print("[WARN] .claude/monitor-config.json exists but could not be parsed - left untouched")
+    sys.exit(0)
+missing = [k for k in defaults if k not in cfg]
+if missing:
+    for k in missing:
+        cfg[k] = defaults[k]
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"[OK] .claude/monitor-config.json updated with new fields: {', '.join(missing)}")
+else:
+    print("[OK] .claude/monitor-config.json kept (already up to date)")
+PY
+else
+    echo "[OK] .claude/monitor-config.json kept (already exists, python3 unavailable to check for new fields)"
+fi
+
+# -----------------------------------------------------------------------
 # STEP 3: Hook scripts
 # -----------------------------------------------------------------------
 echo "[3/6] Writing hook scripts..."
@@ -70,13 +122,22 @@ cat > "$HOOKS_DIR/statusline-monitor.sh" << 'HOOK_EOF'
 raw=$(cat)
 [ -z "$raw" ] && exit 0
 
+# Piping into `python3 - <<'PY' ... PY` doesn't work: the heredoc IS the
+# process's stdin (that's how `-` reads the script), so it always wins over
+# a preceding pipe and sys.stdin.read() inside the script sees EOF, not the
+# payload. Write the payload to a temp file and pass its path via argv instead.
+RAW_TMP=$(mktemp 2>/dev/null || echo "/tmp/.tm_raw_$$")
+printf '%s' "$raw" > "$RAW_TMP"
+trap 'rm -f "$RAW_TMP"' EXIT
+
 # Parse all fields in one python3 pass (avoids multiple subshells)
 if command -v python3 &>/dev/null; then
-    eval "$(echo "$raw" | python3 - <<'PY'
+    eval "$(python3 - "$RAW_TMP" <<'PY'
 import sys, json, datetime
 
 try:
-    d = json.load(sys.stdin)
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
 except Exception:
     sys.exit(0)
 
@@ -89,14 +150,16 @@ ws      = d.get("workspace", {})
 cost_d  = d.get("cost", {})
 model_d = d.get("model", {})
 
-# Compute pct from all token types (including cache) to match Claude Code's counter
-budget      = int(cw.get("budget_tokens", 0))
+# context_window_size is the correct field name (not budget_tokens).
+# total_input_tokens already includes cache tokens - do not add cache fields again.
+# We take Max(calcPct, used_percentage) to never underestimate vs Claude Code's own counter.
+budget      = int(cw.get("context_window_size", 0))
 tok_in      = int(cw.get("total_input_tokens", 0))
 tok_out     = int(cw.get("total_output_tokens", 0))
-tok_cache_w = int(cw.get("cache_creation_input_tokens", 0))
-tok_cache_r = int(cw.get("cache_read_input_tokens", 0))
-tokens_used = tok_in + tok_out + tok_cache_w + tok_cache_r
-pct = math.ceil(tokens_used * 100.0 / budget) if budget > 0 else int(cw.get("used_percentage", 0))
+tokens_used = tok_in + tok_out
+api_pct     = int(cw.get("used_percentage", 0))
+calc_pct    = math.ceil(tokens_used * 100.0 / budget) if budget > 0 else 0
+pct = max(calc_pct, api_pct)
 
 cost        = float(cost_d.get("total_cost_usd", 0))
 model       = model_d.get("display_name", "Claude")
@@ -119,25 +182,31 @@ def fmt(t):
     if t >= 1000:    return f"{t//1000}k"
     return str(t)
 
+# String fields go through shlex.quote: eval'd by bash below, and real values
+# (e.g. model display names like "Claude Sonnet 5") contain spaces that would
+# otherwise be parsed as separate, unintended commands.
+import shlex
 print(f"PCT={pct}")
 print(f"TOKENS_USED={tokens_used}")
 print(f"COST={cost:.3f}")
-print(f"MODEL={model}")
-print(f"PROJECT_DIR={project_dir}")
+print(f"MODEL={shlex.quote(model)}")
+print(f"PROJECT_DIR={shlex.quote(project_dir)}")
 print(f"PCT_5H={pct_5h}")
 print(f"PCT_WEEK={pct_week}")
-print(f"RESET_STR={reset_str}")
-print(f"TOK_STR={fmt(tokens_used)}")
+print(f"RESET_STR={shlex.quote(reset_str)}")
+print(f"TOK_STR={shlex.quote(fmt(tokens_used))}")
 PY
     )"
 elif command -v jq &>/dev/null; then
-    BUDGET=$(echo "$raw" | jq -r '.context_window.budget_tokens // 0')
-    TOKENS_USED=$(echo "$raw" | jq -r '(.context_window.total_input_tokens // 0) + (.context_window.total_output_tokens // 0) + (.context_window.cache_creation_input_tokens // 0) + (.context_window.cache_read_input_tokens // 0)')
+    BUDGET=$(echo "$raw" | jq -r '.context_window.context_window_size // 0')
+    TOKENS_USED=$(echo "$raw" | jq -r '(.context_window.total_input_tokens // 0) + (.context_window.total_output_tokens // 0)')
+    API_PCT=$(echo "$raw" | jq -r '.context_window.used_percentage // 0')
     if [ "${BUDGET:-0}" -gt 0 ] 2>/dev/null; then
-        PCT=$(awk "BEGIN { x=$TOKENS_USED*100.0/$BUDGET; i=int(x); printf \"%d\", (x>i)?i+1:i }")
+        CALC_PCT=$(awk "BEGIN { x=$TOKENS_USED*100.0/$BUDGET; i=int(x); printf \"%d\", (x>i)?i+1:i }")
     else
-        PCT=$(echo "$raw" | jq -r '.context_window.used_percentage // 0')
+        CALC_PCT=0
     fi
+    PCT=$(( CALC_PCT > API_PCT ? CALC_PCT : API_PCT ))
     COST=$(echo "$raw"  | jq -r '.cost.total_cost_usd // 0')
     MODEL=$(echo "$raw" | jq -r '.model.display_name // "Claude"')
     PROJECT_DIR=$(echo "$raw" | jq -r '.workspace.project_dir // .workspace.current_dir // .cwd // ""')
@@ -172,16 +241,21 @@ PY
     )"
 fi
 
-# 5h rate-limit alert flags (default: enabled, 96%) from monitor-config.json
+# Display toggles + 5h rate-limit alert flags from monitor-config.json (default: all on, 96%)
 save_on_5h=true; threshold_5h=96
+show_repo=true; show_branch=true; show_context=true; show_5h=true
+show_reset=true; show_week=true; show_cost=true; show_model=true
 if [ -f "$CFG_FILE" ] && command -v python3 &>/dev/null; then
-    read -r save_on_5h threshold_5h <<< "$(python3 - "$CFG_FILE" <<'PY'
+    read -r save_on_5h threshold_5h show_repo show_branch show_context show_5h show_reset show_week show_cost show_model <<< "$(python3 - "$CFG_FILE" <<'PY'
 import sys, json
 try:
     with open(sys.argv[1]) as f: c = json.load(f)
-    print(str(c.get("save_on_5h_threshold", True)).lower(), int(c.get("rate_limit_5h_threshold_pct", 96)))
+    def b(k): return str(c.get(k, True)).lower()
+    print(str(c.get("save_on_5h_threshold", True)).lower(), int(c.get("rate_limit_5h_threshold_pct", 96)),
+          b("show_repo"), b("show_branch"), b("show_context"), b("show_5h"),
+          b("show_reset"), b("show_week"), b("show_cost"), b("show_model"))
 except Exception:
-    print("true 96")
+    print("true 96 true true true true true true true true")
 PY
     )"
 fi
@@ -278,17 +352,24 @@ if [ -n "$PROJECT_DIR" ] && [ -d "$PROJECT_DIR/.git" ]; then
     repo=$(basename "$(git -C "$PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null || echo "")
 fi
 
-cost_str=$(printf '%.3f' "$COST")
+cost_str=$(LC_NUMERIC=C printf '%.3f' "$COST")
 sep="${DIM}|${RST}"
 
 parts=()
-[ -n "$repo" ]   && parts+=("${BOLD}${YEL}${repo}${RST}")
-[ -n "$branch" ] && parts+=("${BOLD}${CYN}(${branch})${RST}")
-parts+=("${alert} [${bar}] ${PCT}% (${TOK_STR})")
-parts+=("${MAG}5h: ${PCT_5H}%${RST}  reset ${RESET_STR}")
-parts+=("${BLU}Week: ${PCT_WEEK}%${RST}")
-parts+=("${YEL}\$${cost_str}${RST}")
-parts+=("${CYN}${MODEL}${RST}")
+[ "$show_repo"    = "true" ] && [ -n "$repo" ]   && parts+=("${BOLD}${YEL}${repo}${RST}")
+[ "$show_branch"  = "true" ] && [ -n "$branch" ] && parts+=("${BOLD}${CYN}(${branch})${RST}")
+[ "$show_context" = "true" ] && parts+=("${alert} [${bar}] ${PCT}% (${TOK_STR})")
+
+rate_str=""
+[ "$show_5h"    = "true" ] && rate_str="${MAG}5h: ${PCT_5H}%${RST}"
+if [ "$show_reset" = "true" ]; then
+    if [ -n "$rate_str" ]; then rate_str="$rate_str  reset ${RESET_STR}"; else rate_str="reset ${RESET_STR}"; fi
+fi
+[ -n "$rate_str" ] && parts+=("$rate_str")
+
+[ "$show_week"  = "true" ] && parts+=("${BLU}Week: ${PCT_WEEK}%${RST}")
+[ "$show_cost"  = "true" ] && parts+=("${YEL}\$${cost_str}${RST}")
+[ "$show_model" = "true" ] && parts+=("${CYN}${MODEL}${RST}")
 
 out=""
 for i in "${!parts[@]}"; do
@@ -576,9 +657,9 @@ echo "[OK] .claude/commands/save-context.md created"
 # -----------------------------------------------------------------------
 echo "[5/6] Writing .claude/settings.json..."
 
-NEW_STATUSLINE='"statusLine":{"type":"command","command":"bash .claude/hooks/statusline-monitor.sh"}'
-NEW_PRECOMPACT='"PreCompact":[{"hooks":[{"type":"command","command":"bash .claude/hooks/pre-compact.sh"}]}]'
-NEW_STOP='"Stop":[{"hooks":[{"type":"command","command":"bash .claude/hooks/stop-hook.sh"}]}]'
+NEW_STATUSLINE='"statusLine":{"type":"command","command":"bash '"$HOOKS_DIR"'/statusline-monitor.sh"}'
+NEW_PRECOMPACT='"PreCompact":[{"hooks":[{"type":"command","command":"bash '"$HOOKS_DIR"'/pre-compact.sh"}]}]'
+NEW_STOP='"Stop":[{"hooks":[{"type":"command","command":"bash '"$HOOKS_DIR"'/stop-hook.sh"}]}]'
 
 if [ -f "$SETTINGS" ] && command -v python3 &>/dev/null; then
     python3 - "$SETTINGS" <<PY
@@ -587,11 +668,11 @@ import json, sys
 with open(sys.argv[1]) as f:
     s = json.load(f)
 
-s["statusLine"] = {"type": "command", "command": "bash .claude/hooks/statusline-monitor.sh"}
+s["statusLine"] = {"type": "command", "command": "bash $HOOKS_DIR/statusline-monitor.sh"}
 s.setdefault("hooks", {})
-s["hooks"]["PreCompact"] = [{"hooks": [{"type": "command", "command": "bash .claude/hooks/pre-compact.sh"}]}]
-s["hooks"]["Stop"]       = [{"hooks": [{"type": "command", "command": "bash .claude/hooks/stop-hook.sh"}]}]
-s["hooks"]["PostToolUse"] = [{"matcher": "EnterWorktree", "hooks": [{"type": "command", "command": "bash .claude/hooks/post-worktree-sync.sh"}]}]
+s["hooks"]["PreCompact"] = [{"hooks": [{"type": "command", "command": "bash $HOOKS_DIR/pre-compact.sh"}]}]
+s["hooks"]["Stop"]       = [{"hooks": [{"type": "command", "command": "bash $HOOKS_DIR/stop-hook.sh"}]}]
+s["hooks"]["PostToolUse"] = [{"matcher": "EnterWorktree", "hooks": [{"type": "command", "command": "bash $HOOKS_DIR/post-worktree-sync.sh"}]}]
 
 with open(sys.argv[1], "w") as f:
     json.dump(s, f, indent=2)
@@ -603,7 +684,7 @@ else
 {
   "statusLine": {
     "type": "command",
-    "command": "bash .claude/hooks/statusline-monitor.sh"
+    "command": "bash $HOOKS_DIR/statusline-monitor.sh"
   },
   "hooks": {
     "PreCompact": [
@@ -611,7 +692,7 @@ else
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/pre-compact.sh"
+            "command": "bash $HOOKS_DIR/pre-compact.sh"
           }
         ]
       }
@@ -621,7 +702,7 @@ else
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/stop-hook.sh"
+            "command": "bash $HOOKS_DIR/stop-hook.sh"
           }
         ]
       }
@@ -632,7 +713,7 @@ else
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/post-worktree-sync.sh"
+            "command": "bash $HOOKS_DIR/post-worktree-sync.sh"
           }
         ]
       }

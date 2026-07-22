@@ -1,4 +1,4 @@
-[Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+﻿[Console]::InputEncoding  = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $raw = [Console]::In.ReadToEnd()
@@ -26,7 +26,7 @@ $pct     = [Math]::Max($calcPct, $apiPct)
 $cost  = if ($null -ne $json.cost.total_cost_usd) { $json.cost.total_cost_usd } else { 0 }
 $model = if ($json.model.display_name) { $json.model.display_name } else { "Claude" }
 
-# -- Rate limits (directly from payload) --
+# â”€â”€ Rate limits (directly from payload) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 $pct5h      = if ($null -ne $json.rate_limits.five_hour.used_percentage) { [int]$json.rate_limits.five_hour.used_percentage } else { 0 }
 $pctWeek    = if ($null -ne $json.rate_limits.seven_day.used_percentage) { [int]$json.rate_limits.seven_day.used_percentage } else { 0 }
 $resetsAt   = if ($null -ne $json.rate_limits.five_hour.resets_at)       { [long]$json.rate_limits.five_hour.resets_at }       else { 0 }
@@ -36,7 +36,7 @@ if ($resetsAt -gt 0) {
     try { $resetStr = [DateTimeOffset]::FromUnixTimeSeconds($resetsAt).ToLocalTime().ToString("HH:mm") } catch {}
 }
 
-# -- Git info --
+# â”€â”€ Git info â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 $repo = ""; $branch = ""
 $projectDir = if ($json.workspace.project_dir) { $json.workspace.project_dir } elseif ($json.cwd) { $json.cwd } else { "" }
 if ($projectDir -and (Test-Path "$projectDir\.git")) {
@@ -155,14 +155,14 @@ if ($trigger5h) {
     $alertObj | ConvertTo-Json | Out-File (Join-Path $claudeDir "pending-5h-alert.json") -Encoding UTF8 -Force
 }
 
-# -- Helpers --
+# â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function Format-Tokens($t) {
     if ($t -ge 1000000) { return "$([math]::Round($t/1000000,1))M" }
     if ($t -ge 1000)    { return "$([int]($t/1000))k" }
     return "$t"
 }
 
-# -- Progress bar --
+# â”€â”€ Progress bar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 $barWidth = 20
 $filled   = [math]::Round($pct * $barWidth / 100)
 $bar = ""

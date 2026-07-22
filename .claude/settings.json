@@ -23,6 +23,17 @@
                                                  }
                                              ]
                                }
-                           ]
+                           ],
+                  "PostToolUse":  [
+                                      {
+                                          "matcher":  "EnterWorktree",
+                                          "hooks":  [
+                                                        {
+                                                            "type":  "command",
+                                                            "command":  "powershell -NoProfile -NonInteractive -File \".claude\\hooks\\post-worktree-sync.ps1\""
+                                                        }
+                                                    ]
+                                      }
+                                  ]
               }
 }
